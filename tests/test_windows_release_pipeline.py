@@ -51,7 +51,7 @@ class WindowsReleasePipelineTests(unittest.TestCase):
 
     def test_upgrade_test_exercises_installed_gui_twice(self):
         workflow = (ROOT / '.github/workflows/build-friendly-animator.yml').read_text()
-        self.assertIn('GUI smoke failed after pass $pass', workflow)
+        self.assertIn("GUI smoke failed after pass ${pass}", workflow)
         self.assertIn('Uninstall after upgrade failed', workflow)
 
     def test_smoke_checks_actual_window_states_and_resizing(self):
