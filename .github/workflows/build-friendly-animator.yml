@@ -79,7 +79,7 @@ jobs:
             $exe = Join-Path $target 'SlimeHouseFriendlyAnimator.exe'
             if (!(Test-Path $exe)) { throw "EXE missing after pass $pass" }
             $p = Start-Process -FilePath $exe -ArgumentList '--smoke-test' -Wait -PassThru
-            if ($p.ExitCode -ne 0) { throw "GUI smoke failed after pass $pass: $($p.ExitCode)" }
+            if ($p.ExitCode -ne 0) { throw "GUI smoke failed after pass ${pass}: $($_.Exception.Message)" }
             if (!((Get-FileHash -Algorithm SHA256 $project).Hash -eq $expectedHash)) {
               throw "User project changed during install/upgrade pass $pass"
             }
