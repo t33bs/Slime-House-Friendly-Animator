@@ -5,6 +5,7 @@ from pathlib import Path
 from PIL import Image
 from PySide6.QtCore import Qt, QTimer, Signal, QSettings, QThread, QStandardPaths
 from PySide6.QtGui import QImage, QPixmap, QIcon, QPainter, QPen, QColor, QCursor
+from pathlib import Path
 from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QSplitter,QLabel,
  QPushButton,QListWidget,QComboBox,QSpinBox,QFormLayout,QFileDialog,QMessageBox,QScrollArea,QCheckBox, QSlider, QTabBar, QMenu, QInputDialog, QColorDialog)
 from studio.release_config import APP_VERSION, UPDATE_MANIFEST_URL, UPDATE_PUBLIC_KEY_B64
@@ -191,13 +192,13 @@ class Suite(QMainWindow):
         self.setStyleSheet('QWidget{background:#202a2b;color:#e4efe5;font-size:13px} QPushButton{background:#344c3e;border:1px solid #6e9d70;padding:8px;border-radius:5px} QPushButton:hover{background:#446b50} QPushButton:checked{background:#587f45;border:2px solid #b4ed70;color:#ffffff} QPushButton:disabled{color:#7f9288;border-color:#44554a} QListWidget,QComboBox,QSpinBox{background:#2b3835;border:1px solid #607c66;padding:5px} QLabel{background:transparent}')
         base=QWidget();self.setCentralWidget(base);outer=QVBoxLayout(base)
         top_container=QWidget();top=QHBoxLayout(top_container);top.setContentsMargins(0,0,0,0)
-        top_scroll=QScrollArea();top_scroll.setWidget(top_container);top_scroll.setWidgetResizable(True);top_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded);top_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff);top_scroll.setFixedHeight(54);outer.addWidget(top_scroll)
+        top_scroll=QScrollArea();top_scroll.setWidget(top_container);top_scroll.setWidgetResizable(True);top_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded);top_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff);top_scroll.setFixedHeight(42);outer.addWidget(top_scroll)
         for title,callback in [('Import PNG assets',self.import_assets),('Open creature',self.open_project),('New creature',self.new_project),('Save creature',self.save_project),('Export Sprite Sheet',self.export),('Export GIF / APNG',self.export_animated),('Export Frame PNG',self.export_current_frame),('Replace Frame PNG',self.replace_current_frame_png)]:
             b=QPushButton(title);b.clicked.connect(callback);top.addWidget(b)
         update_button=QPushButton('Check for updates');update_button.clicked.connect(self.check_for_updates);top.addWidget(update_button)
         self.status=QLabel('Welcome! Import PNG parts, pick an animation, and create your first pose.');outer.addWidget(self.status)
         mode_container=QWidget();modebar=QHBoxLayout(mode_container);modebar.setContentsMargins(0,0,0,0)
-        mode_scroll=QScrollArea();mode_scroll.setWidget(mode_container);mode_scroll.setWidgetResizable(True);mode_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded);mode_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff);mode_scroll.setFixedHeight(56);outer.addWidget(mode_scroll)
+        mode_scroll=QScrollArea();mode_scroll.setWidget(mode_container);mode_scroll.setWidgetResizable(True);mode_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded);mode_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff);mode_scroll.setFixedHeight(42);outer.addWidget(mode_scroll)
         self.mode=QPushButton('Easy Mode 🌱  •  Switch to Advanced');self.mode.clicked.connect(self.toggle_mode);modebar.addWidget(self.mode)
         undo=QPushButton('↶ Undo');undo.clicked.connect(self.undo);modebar.addWidget(undo)
         redo=QPushButton('↷ Redo');redo.clicked.connect(self.redo);modebar.addWidget(redo)
@@ -205,12 +206,14 @@ class Suite(QMainWindow):
         QShortcut(QKeySequence('Ctrl+Z'),self,activated=self.undo)
         QShortcut(QKeySequence('Ctrl+Shift+Z'),self,activated=self.redo)
         QShortcut(QKeySequence('Ctrl+Y'),self,activated=self.redo)
-        self.onion=QCheckBox('Ghost nearby poses');self.onion.setChecked(False);self.onion.setToolTip('Show faint neighboring poses to help you judge movement. Guides are never exported.');modebar.addWidget(self.onion)
-        self.onion_next=QCheckBox('Also show next');self.onion_next.setToolTip('Show the following pose as another faint guide.');modebar.addWidget(self.onion_next);self.onion_next.toggled.connect(self.refresh)
+        self.onion=QCheckBox('Ghost nearby poses');self.onion.setChecked(False);self.onion.setToolTip('Show faint neighboring poses to help you judge movement. Guides are never exported.');# Ghost controls are now located at the top of the left tool panel.
+        self.onion_next=QCheckBox('Also show next');self.onion_next.setToolTip('Show the following pose as another faint guide.');self.onion_next.toggled.connect(self.refresh)
         self.onion.stateChanged.connect(self.refresh)
         modebar.addStretch(1)
         splitter=QSplitter(Qt.Orientation.Horizontal);outer.addWidget(splitter,1)
-        left=QWidget();ll=QVBoxLayout(left);ll.addWidget(QLabel('ASSET LIBRARY'))
+        left=QWidget();ll=QVBoxLayout(left);ll.setContentsMargins(5,4,5,4)
+        ghost_row=QHBoxLayout();ghost_row.addWidget(self.onion);ghost_row.addWidget(self.onion_next);ll.addLayout(ghost_row)
+        ll.addWidget(QLabel('ASSET LIBRARY'))
         self.assets=QListWidget();self.assets.currentRowChanged.connect(self.select_asset);ll.addWidget(self.assets,1)
         order=QHBoxLayout();ll.addLayout(order)
         for label,offset in [('Move layer up',1),('Move layer down',-1)]:
@@ -291,7 +294,7 @@ class Suite(QMainWindow):
         self.slimer_selection=None
 
         splitter.addWidget(self.scroll_panel(left))
-        middle=QWidget();ml=QVBoxLayout(middle)
+        middle=QWidget();ml=QVBoxLayout(middle);ml.setContentsMargins(5,2,5,3);ml.setSpacing(3)
         self.choose_toggle=QPushButton('▾ Choose Animation')
         self.choose_toggle.setCheckable(True);self.choose_toggle.setChecked(self.settings.value('choose_open',True,type=bool))
         ml.addWidget(self.choose_toggle)
@@ -299,7 +302,7 @@ class Suite(QMainWindow):
         self.recipe_toggle=QPushButton('▾ Follow Recipe')
         self.recipe_toggle.setCheckable(True);self.recipe_toggle.setChecked(self.settings.value('recipe_open',True,type=bool))
         ml.addWidget(self.recipe_toggle)
-        self.steps=QListWidget();self.steps.setMaximumHeight(180);self.steps.currentRowChanged.connect(self.select_step);ml.addWidget(self.steps)
+        self.steps=QListWidget();self.steps.setMaximumHeight(105);self.steps.currentRowChanged.connect(self.select_step);ml.addWidget(self.steps)
         self.instruction=QLabel();self.instruction.setWordWrap(True);ml.addWidget(self.instruction)
         self.choose_toggle.toggled.connect(lambda on:(self.anim.setVisible(on),self.settings.setValue('choose_open',on)))
         self.recipe_toggle.toggled.connect(lambda on:(self.steps.setVisible(on),self.instruction.setVisible(on),self.settings.setValue('recipe_open',on)))
@@ -321,7 +324,7 @@ class Suite(QMainWindow):
         self.buddy_toggle.toggled.connect(lambda enabled:self.settings.setValue("slime_buddy_enabled",enabled))
         self.refresh_buddy()
         ml.addWidget(QLabel('STEP 2 • BUILD YOUR POSE — DRAG PARTS ON THE CANVAS'))
-        self.canvas=DragCanvas();self.canvas.slimer_stroke.connect(self.slimer_paint);self.canvas.slimer_stroke_start.connect(self.slimer_start_stroke);self.canvas.slimer_drag.connect(self.slimer_drag_transform);self.canvas.slimer_drag_start.connect(self.slimer_start_transform);self.canvas.slimer_drag_end.connect(self.slimer_end_transform);self.canvas.moved.connect(self.drag_part);self.canvas.resized.connect(self.resize_drag);self.canvas.picked.connect(self.assets.setCurrentRow);self.canvas.anchor_chosen.connect(self.place_anchor);self.canvas.angle_chosen.connect(self.turn_part);self.canvas.setMinimumHeight(310);self.canvas.setStyleSheet('background:#303e3c;border:1px solid #64866b');ml.addWidget(self.canvas,1);self.canvas.setToolTip('Click a part to select. Drag to move, use the green corner to resize, or drag the blue circle to turn.')
+        self.canvas=DragCanvas();self.canvas.slimer_stroke.connect(self.slimer_paint);self.canvas.slimer_stroke_start.connect(self.slimer_start_stroke);self.canvas.slimer_drag.connect(self.slimer_drag_transform);self.canvas.slimer_drag_start.connect(self.slimer_start_transform);self.canvas.slimer_drag_end.connect(self.slimer_end_transform);self.canvas.moved.connect(self.drag_part);self.canvas.resized.connect(self.resize_drag);self.canvas.picked.connect(self.assets.setCurrentRow);self.canvas.anchor_chosen.connect(self.place_anchor);self.canvas.angle_chosen.connect(self.turn_part);self.canvas.setMinimumHeight(380);self.canvas.setStyleSheet('background:#303e3c;border:1px solid #64866b');ml.addWidget(self.canvas,1);self.canvas.setToolTip('Click a part to select. Drag to move, use the green corner to resize, or drag the blue circle to turn.')
         nav=QHBoxLayout();ml.addLayout(nav)
         nav.addWidget(QLabel('Canvas view:'))
         fit=QPushButton('Fit to Canvas');fit.setToolTip('Show the whole creature again (does not resize your artwork).');fit.clicked.connect(self.canvas.reset_view);nav.addWidget(fit)
@@ -355,15 +358,30 @@ class Suite(QMainWindow):
             button=QPushButton(label);button.setToolTip('Edit the saved poses in this animation. You can undo this change.');button.clicked.connect(callback);timeline_tools.addWidget(button)
         splitter.addWidget(self.scroll_panel(middle))
         right=QWidget();rl=QVBoxLayout(right);rl.addWidget(QLabel('STEP 3 • COMPARE & PREVIEW'))
-        self.buddy_mascot=QLabel('  ▄██▄  SLIME BUDDY\n (•ᴗ•)  ┌──────────────────┐\n  ▀▀   │ Tips for your tools! │\n       └──────────────────┘')
-        self.buddy_mascot.setStyleSheet('color:#a9eeb0;background:#263a32;border:1px solid #739d72;padding:5px;font-family:monospace')
-        rl.addWidget(self.buddy_mascot)
+        buddy_line=QHBoxLayout();rl.addLayout(buddy_line)
+        self.buddy_mascot=QLabel();self.buddy_mascot.setFixedSize(56,56)
+        self.buddy_mascot.setPixmap(QPixmap(str(Path(__file__).resolve().parent/'studio'/'assets'/'slime_buddy_16bit.png')).scaled(56,56,Qt.AspectRatioMode.KeepAspectRatio,Qt.TransformationMode.FastTransformation))
+        buddy_line.addWidget(self.buddy_mascot)
+        self.buddy_bubble=QLabel('SLIME BUDDY\nTips for your tools!');self.buddy_bubble.setWordWrap(True)
+        self.buddy_bubble.setStyleSheet('color:#d8f6cf;background:#263a32;border:2px solid #9bdc8b;padding:6px;font-family:monospace')
+        buddy_line.addWidget(self.buddy_bubble,1)
+        self.buddy_dock_toggle=QCheckBox('ON');self.buddy_dock_toggle.setChecked(self.buddy_toggle.isChecked())
+        self.buddy_dock_toggle.setToolTip('Turn Slime Buddy guidance on or off. Preference is saved.')
+        self.buddy_dock_toggle.toggled.connect(self.buddy_toggle.setChecked)
+        self.buddy_toggle.toggled.connect(self.buddy_dock_toggle.setChecked)
+        buddy_line.addWidget(self.buddy_dock_toggle)
         rl.addWidget(self.slimer_buddy_tip)
 
-        rl.addWidget(QLabel('Generic motion example • synchronized with your poses'))
+        self.reference_toggle=QCheckBox('Show optional 2D pixel animation reference')
+        self.reference_toggle.setChecked(self.settings.value('show_pixel_reference',False,type=bool))
+        self.reference_toggle.setToolTip('Optional frame-by-frame movement inspiration; not an anatomy rule. Hide it to maximize your sprite preview.')
+        rl.addWidget(self.reference_toggle)
+        self.reference_toggle.toggled.connect(lambda checked:self.settings.setValue('show_pixel_reference',checked))
         self.reference_body=QComboBox();self.reference_body.addItems(['Biped','Quadruped','Floating']);self.reference_body.setToolTip('Pick a simple reference shape. This does not change your creature.');self.reference_body.currentIndexChanged.connect(self.refresh_preview);self.reference_body.currentIndexChanged.connect(self.refresh);rl.addWidget(self.reference_body)
         self.desired=QLabel();self.desired.setAlignment(Qt.AlignmentFlag.AlignCenter);self.desired.setMinimumHeight(135);self.desired.setStyleSheet('background:#303e3c');rl.addWidget(self.desired)
         self.desired_label=QLabel('Reference step');self.desired_label.setWordWrap(True);rl.addWidget(self.desired_label)
+        self.reference_toggle.toggled.connect(lambda checked:(self.reference_body.setVisible(checked),self.desired.setVisible(checked),self.desired_label.setVisible(checked)))
+        for widget in (self.reference_body,self.desired,self.desired_label):widget.setVisible(self.reference_toggle.isChecked())
         rl.addWidget(QLabel('Your creature • frame preview'))
         preview_zoom_row=QHBoxLayout();rl.addLayout(preview_zoom_row)
         self.preview_zoom=150
@@ -504,6 +522,7 @@ class Suite(QMainWindow):
         self.pose_tip.setVisible(enabled)
         self.slimer_buddy_tip.setVisible(enabled and self.slimer_toggle.isChecked())
         if hasattr(self,'buddy_mascot'):self.buddy_mascot.setVisible(enabled)
+        if hasattr(self,'buddy_bubble'):self.buddy_bubble.setVisible(enabled)
         if enabled:
             self.buddy_details.setText(station_guide(self.buddy_station.currentText()))
 
