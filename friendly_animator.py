@@ -4,9 +4,9 @@ import math
 from pathlib import Path
 from PIL import Image
 from PySide6.QtCore import Qt, QTimer, Signal, QSettings, QThread, QStandardPaths
-from PySide6.QtGui import QImage, QPixmap, QIcon, QPainter
+from PySide6.QtGui import QImage, QPixmap, QIcon, QPainter, QPen, QColor, QCursor
 from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QSplitter,QLabel,
- QPushButton,QListWidget,QComboBox,QSpinBox,QFormLayout,QFileDialog,QMessageBox,QScrollArea,QCheckBox, QSlider, QTabBar, QMenu, QInputDialog)
+ QPushButton,QListWidget,QComboBox,QSpinBox,QFormLayout,QFileDialog,QMessageBox,QScrollArea,QCheckBox, QSlider, QTabBar, QMenu, QInputDialog, QColorDialog)
 from studio.release_config import APP_VERSION, UPDATE_MANIFEST_URL, UPDATE_PUBLIC_KEY_B64
 from studio.update_manager import check_update, download_verified_installer
 from studio.resource_checks import bundled_resource_report
@@ -14,6 +14,7 @@ from studio.canvas_navigation import geometry as canvas_geometry, zoom_at
 from studio.timeline_tools import timeline_summary, onion_composite
 from studio.pet_suite_model import PetSuiteModel
 from studio.edit_history import EditHistory
+from studio.slimer_tool import SlimerSelection
 from studio.pet_suite_templates import TEMPLATES
 from studio.reference_animation import reference_frame
 from studio.comparison_sync import comparison_position
@@ -36,11 +37,16 @@ class DragCanvas(QLabel):
     anchor_chosen=Signal(int,int)
     angle_chosen=Signal(float)
     view_changed=Signal()
+    slimer_stroke=Signal(int,int,bool)
+    slimer_stroke_start=Signal()
+    slimer_drag=Signal(int,int,str)
+    slimer_drag_start=Signal()
+    slimer_drag_end=Signal()
     def __init__(self):
         super().__init__();self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMouseTracking(True);self._last=None;self._image_size=(128,128)
         self.parts=[];self.selected=-1;self._action=None;self.anchor_mode=False;self.anchors={};self.angles={}
-        self.zoom=1.0;self.pan_x=0.0;self.pan_y=0.0;self._pan_last=None;self._art=None
+        self.zoom=1.0;self.pan_x=0.0;self.pan_y=0.0;self._pan_last=None;self._art=None;self.slimer_active=False;self._slimer_painting=False;self.slimer_transform_mode=False;self._slimer_last=None;self.slimer_bounds=None;self._slimer_handle=None
     def _geometry(self):
         return canvas_geometry(self.width(),self.height(),*self._image_size,self.zoom,self.pan_x,self.pan_y)
     def _pixel(self,pos):
@@ -55,7 +61,32 @@ class DragCanvas(QLabel):
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform,False)
         scale,ox,oy=self._geometry()
         painter.drawPixmap(round(ox),round(oy),max(1,round(self._image_size[0]*scale)),max(1,round(self._image_size[1]*scale)),self._art)
+        if self.slimer_active and self.slimer_bounds is not None:
+            x0,y0,x1,y1=self.slimer_bounds
+            left=ox+x0*scale;top=oy+y0*scale
+            width=max(1,(x1-x0)*scale);height=max(1,(y1-y0)*scale)
+            painter.setPen(QPen(QColor('#b5ff8d'),2,Qt.PenStyle.DashLine))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(round(left),round(top),round(width),round(height))
+            if self.slimer_transform_mode:
+                # Square resize handle and round rotation handle stay visible at any zoom.
+                painter.setPen(QPen(QColor('#172d24'),2))
+                painter.setBrush(QColor('#aaff80'))
+                painter.drawRect(round(left+width-5),round(top+height-5),10,10)
+                painter.setBrush(QColor('#75c9ff'))
+                painter.drawEllipse(round(left+width/2-5),round(top-25),10,10)
+                painter.setPen(QPen(QColor('#75c9ff'),2))
+                painter.drawLine(round(left+width/2),round(top-15),round(left+width/2),round(top))
         painter.end()
+    def _slimer_hit_handle(self,pos):
+        if not self.slimer_bounds:return None
+        scale,ox,oy=self._geometry()
+        x0,y0,x1,y1=self.slimer_bounds
+        x=pos.x();y=pos.y();right=ox+x1*scale;bottom=oy+y1*scale
+        mid=ox+(x0+x1)*scale/2;top=oy+y0*scale
+        if abs(x-mid)<=12 and abs(y-(top-20))<=12:return 'rotate'
+        if abs(x-right)<=12 and abs(y-bottom)<=12:return 'scale'
+        return None
     def wheelEvent(self,event):
         # Zoom around the pointer so the artwork beneath it stays in place.
         steps=event.angleDelta().y()/120
@@ -66,6 +97,13 @@ class DragCanvas(QLabel):
         self.zoom=1.0;self.pan_x=0.0;self.pan_y=0.0
         self.update();self.view_changed.emit()
     def mousePressEvent(self,event):
+        if self.slimer_active and event.button() in (Qt.MouseButton.LeftButton,Qt.MouseButton.RightButton) and not (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            x,y=self._pixel(event.position())
+            if self.slimer_transform_mode and event.button()==Qt.MouseButton.LeftButton:
+                self._slimer_last=(x,y);self._slimer_handle=self._slimer_hit_handle(event.position());self.slimer_drag_start.emit();event.accept();return
+            self._slimer_painting=True;self._slimer_erase=event.button()==Qt.MouseButton.RightButton
+            self.slimer_stroke_start.emit()
+            self.slimer_stroke.emit(int(x),int(y),self._slimer_erase);event.accept();return
         if event.button()==Qt.MouseButton.MiddleButton or (event.button()==Qt.MouseButton.LeftButton and event.modifiers() & Qt.KeyboardModifier.ControlModifier):
             self._pan_last=event.position();event.accept();return
         if event.button()==Qt.MouseButton.LeftButton:
@@ -94,6 +132,15 @@ class DragCanvas(QLabel):
             if not self._action:self._last=None
         super().mousePressEvent(event)
     def mouseMoveEvent(self,event):
+        if self.slimer_active and self._slimer_last is not None:
+            x,y=self._pixel(event.position());dx=round(x-self._slimer_last[0]);dy=round(y-self._slimer_last[1])
+            if dx or dy:
+                mode=self._slimer_handle or ('rotate' if event.modifiers() & Qt.KeyboardModifier.AltModifier else ('scale' if event.modifiers() & Qt.KeyboardModifier.ShiftModifier else 'move'))
+                self.slimer_drag.emit(dx,dy,mode)
+                self._slimer_last=(self._slimer_last[0]+dx,self._slimer_last[1]+dy)
+            event.accept();return
+        if self._slimer_painting:
+            x,y=self._pixel(event.position());self.slimer_stroke.emit(int(x),int(y),self._slimer_erase);event.accept();return
         if self._pan_last is not None:
             delta=event.position()-self._pan_last
             self.pan_x+=delta.x();self.pan_y+=delta.y();self._pan_last=event.position()
@@ -112,7 +159,7 @@ class DragCanvas(QLabel):
                 self._last=(self._last[0]+dx,self._last[1]+dy)
         super().mouseMoveEvent(event)
     def mouseReleaseEvent(self,event):
-        self._last=None;self._action=None;self._pan_last=None;super().mouseReleaseEvent(event)
+        self._last=None;self._action=None;self._pan_last=None;self._slimer_painting=False;self._slimer_last=None;self._slimer_handle=None;self.slimer_drag_end.emit();super().mouseReleaseEvent(event)
 
 class UpdateCheckWorker(QThread):
     result = Signal(object, str)
@@ -141,7 +188,7 @@ class Suite(QMainWindow):
         geometry=self.settings.value("window_geometry",None)
         if geometry:self.restoreGeometry(geometry)
         QTimer.singleShot(0,self.ensure_window_visible)
-        self.setStyleSheet('QWidget{background:#202a2b;color:#e4efe5;font-size:13px} QPushButton{background:#344c3e;border:1px solid #6e9d70;padding:8px;border-radius:5px} QPushButton:hover{background:#446b50} QListWidget,QComboBox,QSpinBox{background:#2b3835;border:1px solid #607c66;padding:5px} QLabel{background:transparent}')
+        self.setStyleSheet('QWidget{background:#202a2b;color:#e4efe5;font-size:13px} QPushButton{background:#344c3e;border:1px solid #6e9d70;padding:8px;border-radius:5px} QPushButton:hover{background:#446b50} QPushButton:checked{background:#587f45;border:2px solid #b4ed70;color:#ffffff} QPushButton:disabled{color:#7f9288;border-color:#44554a} QListWidget,QComboBox,QSpinBox{background:#2b3835;border:1px solid #607c66;padding:5px} QLabel{background:transparent}')
         base=QWidget();self.setCentralWidget(base);outer=QVBoxLayout(base)
         top_container=QWidget();top=QHBoxLayout(top_container);top.setContentsMargins(0,0,0,0)
         top_scroll=QScrollArea();top_scroll.setWidget(top_container);top_scroll.setWidgetResizable(True);top_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded);top_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff);top_scroll.setFixedHeight(54);outer.addWidget(top_scroll)
@@ -198,6 +245,47 @@ class Suite(QMainWindow):
         self.reset=QPushButton('↺ Restore original size');self.reset.setToolTip('Restore the PNG’s imported width and height in one undoable step.');self.reset.clicked.connect(self.reset_size);ll.addWidget(self.reset)
         self.advanced_label=QLabel('Advanced tools: exact X/Y coordinates and frame editing')
         ll.addWidget(self.advanced_label)
+        ll.addWidget(QLabel('🟢 SLIMER TOOL • select pixels, then place'))
+        self.slimer_toggle=QPushButton('Activate Slimer Tool');self.slimer_toggle.setCheckable(True);self.slimer_toggle.toggled.connect(self.slimer_toggle_mode);ll.addWidget(self.slimer_toggle)
+        self.slimer_drag_toggle=QPushButton('Drag selected pixels (Shift=resize, Alt=rotate)')
+        self.slimer_drag_toggle.setCheckable(True)
+        self.slimer_drag_toggle.setToolTip('Use the green square to resize and the blue circle to rotate. Slimer Tool: First highlight pixels in Paint Selection mode. Then click here and drag the highlighted area to move it. Hold Shift while dragging to resize; hold Alt while dragging to rotate. For exact adjustments, use the Slime move X/Y, rotate, and size controls. Click Place Frame or Place as Layer when ready.')
+        self.slimer_drag_toggle.toggled.connect(self.slimer_drag_mode)
+        ll.addWidget(self.slimer_drag_toggle)
+        self.slimer_selection_undo=[];self.slimer_selection_redo=[];self._slimer_numeric_replaying=False
+        selection_actions=QHBoxLayout();ll.addLayout(selection_actions)
+        for label,callback in [('Slimer Undo',self.slimer_undo_selection),('Slimer Redo',self.slimer_redo_selection)]:
+            b=QPushButton(label);b.clicked.connect(callback);selection_actions.addWidget(b)
+        self.slimer_copy=QCheckBox('Move Original (clears highlighted pixels from visible layers)');self.slimer_copy.setToolTip('Off (default): copy pixels without changing your original. On: remove selected pixels from visible source layers when placing. Undo restores them.');ll.addWidget(self.slimer_copy)
+        self.slimer_brush=QSpinBox();self.slimer_brush.setRange(1,32);self.slimer_brush.setValue(1);form.addRow('Slimer brush size',self.slimer_brush)
+        self.slimer_dx=QSpinBox();self.slimer_dy=QSpinBox();self.slimer_turn=QSpinBox();self.slimer_scale=QSpinBox()
+        for spin in (self.slimer_dx,self.slimer_dy):spin.setRange(-2048,2048)
+        self.slimer_turn.setRange(-360,360);self.slimer_scale.setRange(10,800);self.slimer_scale.setValue(100)
+        for label,spin in [('Slime move X',self.slimer_dx),('Slime move Y',self.slimer_dy),('Slime rotate °',self.slimer_turn),('Slime size %',self.slimer_scale)]:form.addRow(label,spin)
+        for spin in (self.slimer_dx,self.slimer_dy,self.slimer_turn,self.slimer_scale):
+            spin.valueChanged.connect(lambda value, control=spin: self.slimer_numeric_changed(control, value))
+            spin.setToolTip('Slimer numeric adjustment. Slimer Undo reverses this change without changing placed artwork.')
+        slimer_actions=QHBoxLayout();ll.addLayout(slimer_actions)
+        for label,callback in [('Place as Layer',self.slimer_place_layer),('Place Frame',self.slimer_place_frame),('Clear Selection',self.slimer_clear)]:
+            button=QPushButton(label);button.clicked.connect(callback);slimer_actions.addWidget(button)
+        # Independent, color-coded selection masks for animation phases.
+        # The color is a canvas overlay only; exports never include it.
+        self.slimer_phase_colors={'Start':'#54e88a','Middle':'#58b9ff','End':'#d38bff'}
+        self.slimer_phase_masks={}
+        self.slimer_phase_picker=QComboBox()
+        self.slimer_phase_picker.addItems(self.slimer_phase_colors)
+        self.slimer_phase_picker.setToolTip('Choose which animation phase to highlight. Each phase remembers its own pixel selection; colors are guides only.')
+        self.slimer_phase_picker.currentTextChanged.connect(self.slimer_switch_phase)
+        form.addRow('Highlight phase',self.slimer_phase_picker)
+        phase_buttons=QHBoxLayout();ll.addLayout(phase_buttons)
+        color_button=QPushButton('Change highlight color')
+        color_button.clicked.connect(self.slimer_choose_color)
+        phase_buttons.addWidget(color_button)
+        add_phase=QPushButton('+ New phase')
+        add_phase.clicked.connect(self.slimer_add_phase)
+        phase_buttons.addWidget(add_phase)
+        self.slimer_selection=None
+
         splitter.addWidget(self.scroll_panel(left))
         middle=QWidget();ml=QVBoxLayout(middle);ml.addWidget(QLabel('STEP 1 • CHOOSE AN ANIMATION & FOLLOW THE RECIPE'))
         self.anim=QComboBox();self.anim.addItems(TEMPLATES);self.anim.currentTextChanged.connect(self.change_anim);ml.addWidget(self.anim)
@@ -208,13 +296,18 @@ class Suite(QMainWindow):
         self.buddy_station=QComboBox();self.buddy_station.addItems(STATIONS);self.buddy_station.setToolTip('Choose the station you want help with. This never edits your art.');buddy_row.addWidget(self.buddy_station)
         self.buddy_details=QLabel();self.buddy_details.setWordWrap(True);self.buddy_details.setStyleSheet('color:#c7e9c6;padding:4px');ml.addWidget(self.buddy_details)
         self.pose_tip=QLabel();self.pose_tip.setWordWrap(True);self.pose_tip.setStyleSheet('color:#bce6b9;padding:3px');ml.addWidget(self.pose_tip)
+        self.slimer_buddy_tip=QLabel('🟢 Slime Buddy • Choose a Highlight Phase (Start, Middle, End, or your own) and a color to organize selections. Highlights are guides only and never export. Slimer Tool: Use the green square to resize or the blue circle to rotate your selection. Paint over the pixels you want to adjust, then select Drag Selected Pixels. Drag to move, hold Shift + drag to resize, or Alt + drag to rotate. Need precision? Use the Slime move, rotate, and size number boxes. Finish with Place Frame or Place as Layer.')
+        self.slimer_buddy_tip.setWordWrap(True)
+        self.slimer_buddy_tip.setStyleSheet('color:#c7e9c6;background:#30483b;border:1px solid #64866b;border-radius:6px;padding:8px')
+        self.slimer_buddy_tip.setToolTip('This tip is optional and appears only while Slime Buddy and Slimer Tool are enabled.')
+        ml.addWidget(self.slimer_buddy_tip)
         self.check_button=QPushButton('✓ Check animation readiness');self.check_button.setToolTip('Optional technical checks only. Never judges your artwork.');self.check_button.clicked.connect(self.show_technical_checks);ml.addWidget(self.check_button)
         self.buddy_station.currentTextChanged.connect(self.refresh_buddy)
         self.buddy_toggle.toggled.connect(self.refresh_buddy)
         self.buddy_toggle.toggled.connect(lambda enabled:self.settings.setValue("slime_buddy_enabled",enabled))
         self.refresh_buddy()
         ml.addWidget(QLabel('STEP 2 • BUILD YOUR POSE — DRAG PARTS ON THE CANVAS'))
-        self.canvas=DragCanvas();self.canvas.moved.connect(self.drag_part);self.canvas.resized.connect(self.resize_drag);self.canvas.picked.connect(self.assets.setCurrentRow);self.canvas.anchor_chosen.connect(self.place_anchor);self.canvas.angle_chosen.connect(self.turn_part);self.canvas.setMinimumHeight(310);self.canvas.setStyleSheet('background:#303e3c;border:1px solid #64866b');ml.addWidget(self.canvas,1);self.canvas.setToolTip('Click a part to select. Drag to move, use the green corner to resize, or drag the blue circle to turn.')
+        self.canvas=DragCanvas();self.canvas.slimer_stroke.connect(self.slimer_paint);self.canvas.slimer_stroke_start.connect(self.slimer_start_stroke);self.canvas.slimer_drag.connect(self.slimer_drag_transform);self.canvas.slimer_drag_start.connect(self.slimer_start_transform);self.canvas.slimer_drag_end.connect(self.slimer_end_transform);self.canvas.moved.connect(self.drag_part);self.canvas.resized.connect(self.resize_drag);self.canvas.picked.connect(self.assets.setCurrentRow);self.canvas.anchor_chosen.connect(self.place_anchor);self.canvas.angle_chosen.connect(self.turn_part);self.canvas.setMinimumHeight(310);self.canvas.setStyleSheet('background:#303e3c;border:1px solid #64866b');ml.addWidget(self.canvas,1);self.canvas.setToolTip('Click a part to select. Drag to move, use the green corner to resize, or drag the blue circle to turn.')
         nav=QHBoxLayout();ml.addLayout(nav)
         nav.addWidget(QLabel('Canvas view:'))
         fit=QPushButton('Fit to Canvas');fit.setToolTip('Show the whole creature again (does not resize your artwork).');fit.clicked.connect(self.canvas.reset_view);nav.addWidget(fit)
@@ -382,6 +475,7 @@ class Suite(QMainWindow):
         self.buddy_station.setVisible(enabled)
         self.buddy_details.setVisible(enabled)
         self.pose_tip.setVisible(enabled)
+        self.slimer_buddy_tip.setVisible(enabled and self.slimer_toggle.isChecked())
         if enabled:
             self.buddy_details.setText(station_guide(self.buddy_station.currentText()))
 
@@ -588,6 +682,209 @@ class Suite(QMainWindow):
             height=max(1,round(width*oh/ow))
         self.model.resize_part(self.selected,width,height)
         self.select_asset(self.selected);self.refresh()
+    @staticmethod
+    def _slimer_cursor():
+        """Small pixel-art slime pointer with a precise top-left hotspot."""
+        from PySide6.QtCore import QPoint
+        art=QPixmap(24,24);art.fill(Qt.GlobalColor.transparent)
+        painter=QPainter(art)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor('#183d31'));painter.drawRect(2,2,12,12)
+        painter.setBrush(QColor('#8ee66c'));painter.drawRect(4,4,8,8)
+        painter.setBrush(QColor('#e8fff0'));painter.drawRect(5,6,2,2);painter.drawRect(9,6,2,2)
+        painter.setBrush(QColor('#183d31'));painter.drawRect(6,10,4,1)
+        painter.setPen(QPen(QColor('#f5fff0'),1));painter.drawLine(0,0,0,3);painter.drawLine(0,0,3,0)
+        painter.end()
+        return QCursor(art,0,0)
+
+    def slimer_switch_phase(self, name):
+        if self.slimer_selection is None:
+            return
+        previous=getattr(self,'_slimer_current_phase',None)
+        if previous:
+            self.slimer_phase_masks[previous]=self.slimer_selection.mask.copy()
+        self._slimer_current_phase=name
+        self.slimer_selection.mask=self.slimer_phase_masks.get(name,Image.new('L',self.model.size,0)).copy()
+        self.slimer_selection_undo.clear();self.slimer_selection_redo.clear()
+        self.refresh()
+
+    def slimer_choose_color(self):
+        name=self.slimer_phase_picker.currentText()
+        color=QColorDialog.getColor(QColor(self.slimer_phase_colors[name]),self,'Slimer highlight color')
+        if color.isValid():
+            self.slimer_phase_colors[name]=color.name()
+            self.refresh()
+
+    def slimer_add_phase(self):
+        name,ok=QInputDialog.getText(self,'New animation phase','Phase name:')
+        name=name.strip()
+        if not ok or not name or name in self.slimer_phase_colors:return
+        self.slimer_phase_colors[name]='#ffd166'
+        self.slimer_phase_picker.addItem(name)
+        self.slimer_phase_picker.setCurrentText(name)
+
+    def slimer_toggle_mode(self,enabled):
+        self.canvas.slimer_active=enabled
+        self.canvas.setCursor(self._slimer_cursor() if enabled else Qt.CursorShape.ArrowCursor)
+        self.canvas.anchor_mode=False if enabled else self.canvas.anchor_mode
+        self.slimer_drag_toggle.setEnabled(enabled)
+        self.slimer_drag_toggle.setChecked(False)
+        self.slimer_selection_undo.clear();self.slimer_selection_redo.clear()
+        self._slimer_mouse_transforming=False
+        self._slimer_sync_numeric_values()
+        if enabled:
+            self.slimer_selection=SlimerSelection.empty(self.model.render())
+            self.slimer_phase_masks={}
+            self._slimer_current_phase=self.slimer_phase_picker.currentText()
+        else:
+            self.slimer_selection=None
+        self.refresh_buddy()
+        self.status.setText('Slimer: left-drag to highlight, right-drag to erase. Adjust move/rotate/size, then Place Frame or Place as Layer.' if enabled else 'Slimer brush disabled.')
+        self.refresh()
+
+    def slimer_drag_mode(self,enabled):
+        self.canvas.slimer_transform_mode=enabled
+        self.canvas.update()
+        self.slimer_drag_toggle.setText('Paint selection (click to switch)' if enabled else 'Drag selected pixels (Shift=resize, Alt=rotate)')
+        self.status.setText('Drag to move; hold Shift while dragging to resize, or Alt to rotate.' if enabled else 'Paint with left mouse; erase highlight with right mouse.')
+
+    def _slimer_snapshot(self):
+        return (self.slimer_selection.mask.copy(), self.slimer_dx.value(),
+                self.slimer_dy.value(), self.slimer_scale.value(), self.slimer_turn.value())
+
+    def _slimer_restore(self, snapshot):
+        mask, dx, dy, scale, turn = snapshot
+        self.slimer_selection.mask = mask.copy()
+        for widget, value in ((self.slimer_dx,dx),(self.slimer_dy,dy),
+                              (self.slimer_scale,scale),(self.slimer_turn,turn)):
+            widget.blockSignals(True)
+            widget.setValue(value)
+            widget.blockSignals(False)
+        self._slimer_sync_numeric_values()
+        self.refresh()
+
+    def slimer_numeric_changed(self, control, value):
+        """Record the previous numeric state before a manual spinner adjustment.
+
+        Mouse-driven transforms already record one snapshot at drag start; avoid
+        generating duplicate history entries for their intermediate updates.
+        """
+        if (self.slimer_selection is not None and not self._slimer_numeric_replaying
+                and not getattr(self, '_slimer_mouse_transforming', False)):
+            snapshot = list(self._slimer_snapshot())
+            slot = {self.slimer_dx: 1, self.slimer_dy: 2,
+                    self.slimer_scale: 3, self.slimer_turn: 4}[control]
+            # QSpinBox.valueChanged runs after its value has changed. Capture
+            # the previous value tracked from the last completed adjustment.
+            previous = getattr(self, '_slimer_numeric_values', {}).get(control, value)
+            if previous != value:
+                snapshot[slot] = previous
+                self.slimer_selection_undo.append(tuple(snapshot))
+                self.slimer_selection_redo.clear()
+        if not hasattr(self, '_slimer_numeric_values'):
+            self._slimer_numeric_values = {}
+        self._slimer_numeric_values[control] = value
+        self.refresh()
+
+    def _slimer_sync_numeric_values(self):
+        self._slimer_numeric_values = {spin: spin.value() for spin in
+            (self.slimer_dx, self.slimer_dy, self.slimer_scale, self.slimer_turn)}
+
+    def slimer_end_transform(self):
+        self._slimer_mouse_transforming=False
+        self._slimer_sync_numeric_values()
+
+    def slimer_start_stroke(self):
+        if self.slimer_selection is None:return
+        self.slimer_selection_undo.append(self._slimer_snapshot())
+        self.slimer_selection_redo.clear()
+
+    def slimer_start_transform(self):
+        if self.slimer_selection is None or self.slimer_selection.mask.getbbox() is None:return
+        # One mouse gesture is one history entry, even with many move events.
+        self.slimer_selection_undo.append(self._slimer_snapshot())
+        self.slimer_selection_redo.clear()
+        self._slimer_mouse_transforming=True
+
+    def slimer_undo_selection(self):
+        if self.slimer_selection is None or not self.slimer_selection_undo:return
+        self.slimer_selection_redo.append(self._slimer_snapshot())
+        self._slimer_restore(self.slimer_selection_undo.pop())
+
+    def slimer_redo_selection(self):
+        if self.slimer_selection is None or not self.slimer_selection_redo:return
+        self.slimer_selection_undo.append(self._slimer_snapshot())
+        self._slimer_restore(self.slimer_selection_redo.pop())
+
+    def slimer_drag_transform(self,dx,dy,mode):
+        if self.slimer_selection is None or self.slimer_selection.mask.getbbox() is None:return
+        if mode=='rotate':self.slimer_turn.setValue(self.slimer_turn.value()+dx+dy)
+        elif mode=='scale':self.slimer_scale.setValue(self.slimer_scale.value()+dx+dy)
+        else:
+            self.slimer_dx.setValue(self.slimer_dx.value()+dx)
+            self.slimer_dy.setValue(self.slimer_dy.value()+dy)
+
+    def slimer_paint(self,x,y,erase):
+        if self.slimer_selection is None:return
+        if 0<=x<self.model.size[0] and 0<=y<self.model.size[1]:
+            self.slimer_selection.paint(x,y,(self.slimer_brush.value()-1)//2,erase)
+            self.refresh()
+
+    def slimer_preview(self):
+        if self.slimer_selection is None:return Image.new('RGBA',self.model.size)
+        bounds=self.slimer_selection.mask.getbbox()
+        if bounds is None:return Image.new('RGBA',self.model.size)
+        scale=self.slimer_scale.value()/100
+        return self.slimer_selection.transform(self.slimer_dx.value(),self.slimer_dy.value(),
+            max(1,round((bounds[2]-bounds[0])*scale)),max(1,round((bounds[3]-bounds[1])*scale)),self.slimer_turn.value())
+
+    def slimer_clear(self):
+        if self.slimer_selection is not None:self.slimer_selection=SlimerSelection.empty(self.model.render())
+        self.slimer_phase_masks={}
+        self._slimer_current_phase=self.slimer_phase_picker.currentText()
+        self.slimer_selection_undo.clear();self.slimer_selection_redo.clear()
+        for spin,value in ((self.slimer_dx,0),(self.slimer_dy,0),(self.slimer_turn,0),(self.slimer_scale,100)):
+            spin.blockSignals(True);spin.setValue(value);spin.blockSignals(False)
+        self._slimer_sync_numeric_values()
+        self.refresh()
+
+    def _slimer_erase_original_layers(self, mask):
+        """Erase selected canvas pixels from visible source layers; undo snapshot owns originals."""
+        from PIL import ImageChops
+        for i, part in enumerate(self.model.parts):
+            if not part.get('visible', True):
+                continue
+            image = part['image'].convert('RGBA').copy()
+            x, y = int(part['x']), int(part['y'])
+            # Shift the canvas selection into this layer's local coordinates.
+            local_mask = mask.crop((x, y, x + image.width, y + image.height))
+            image.putalpha(ImageChops.subtract(image.getchannel('A'), local_mask))
+            part['image'] = image
+            if i < len(self.model.originals):
+                self.model.originals[i] = image.copy()
+
+    def _slimer_commit(self,as_frame):
+        selection=self.slimer_selection
+        if selection is None or selection.mask.getbbox() is None:
+            self.status.setText('Highlight some pixels with the Slimer brush first.');return
+        self.remember()  # A complete placement, including new layer/frame, is ONE undo step.
+        if self.slimer_copy.isChecked():
+            self._slimer_erase_original_layers(selection.mask)
+        result=self.slimer_preview()  # Transparent new layer; do not duplicate the entire creature.
+        self.model.import_part('Slimer pose' if as_frame else 'Slimer layer',result)
+        self.assets.addItem(self.model.parts[-1]['name'])
+        self.assets.setCurrentRow(len(self.model.parts)-1)
+        if as_frame:
+            name=self.anim.currentText()
+            index=self.model.insert_frame(name,self.frame+1)
+            self.select_timeline_pose(index)
+        self.slimer_clear()
+        self.status.setText('Slimer placement complete. Main Undo reverses the placement (including Move Original).')
+        self.refresh()
+
+    def slimer_place_layer(self):self._slimer_commit(False)
+    def slimer_place_frame(self):self._slimer_commit(True)
+
     def remember(self):
         self.history.record(self.model)
         self.mark_pose_draft()
@@ -604,12 +901,16 @@ class Suite(QMainWindow):
         self.refresh()
 
     def undo(self):
+        if self.slimer_toggle.isChecked() and self.slimer_selection_undo:
+            self.slimer_undo_selection();self.status.setText("Undid Slimer selection or transform.");return
         if self.history.undo(self.model):
             self._pose_draft_dirty=False
             self._after_history_change()
             self.status.setText('Undid the last edit. Redo restores it.')
 
     def redo(self):
+        if self.slimer_toggle.isChecked() and self.slimer_selection_redo:
+            self.slimer_redo_selection();self.status.setText("Restored Slimer selection or transform.");return
         if self.history.redo(self.model):
             self._pose_draft_dirty=False
             self._after_history_change()
@@ -905,6 +1206,21 @@ class Suite(QMainWindow):
             composed.alpha_composite(guide)
         rgba=composed.convert('RGBA');data=rgba.tobytes('raw','RGBA')
         image=QImage(data,rgba.width,rgba.height,rgba.width*4,QImage.Format.Format_RGBA8888).copy()
+        self.canvas.slimer_bounds=None
+        if self.slimer_toggle.isChecked() and self.slimer_selection is not None:
+            from PIL import ImageDraw
+            preview=self.slimer_preview()
+            self.canvas.slimer_bounds=preview.getchannel('A').getbbox()
+            if self.canvas.slimer_bounds is None and self.slimer_selection.mask.getbbox():
+                x0,y0,x1,y1=self.slimer_selection.mask.getbbox()
+                self.canvas.slimer_bounds=(x0+self.slimer_dx.value(),y0+self.slimer_dy.value(),x1+self.slimer_dx.value(),y1+self.slimer_dy.value())
+            composed.alpha_composite(preview)
+            marker=Image.new('RGBA',composed.size)
+            marker.putalpha(self.slimer_selection.mask.point(lambda v: 85 if v else 0))
+            chosen=QColor(self.slimer_phase_colors.get(self.slimer_phase_picker.currentText(),'#54e88a'))
+            tint=Image.new('RGBA',composed.size,(chosen.red(),chosen.green(),chosen.blue(),0));tint.putalpha(marker.getchannel('A'))
+            composed.alpha_composite(tint)
+            data=composed.tobytes('raw','RGBA');image=QImage(data,composed.width,composed.height,composed.width*4,QImage.Format.Format_RGBA8888).copy()
         self.canvas.set_art(QPixmap.fromImage(image))
         self.refresh_preview()
         recipe=TEMPLATES[self.anim.currentText()];step=recipe[self.frame % len(recipe)]
