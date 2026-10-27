@@ -14,6 +14,7 @@ SolidCompression=yes
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 UninstallDisplayIcon={app}\SlimeHouseFriendlyAnimator.exe
+SetupIconFile=..\studio\assets\wizard_slime.ico
 CloseApplications=yes
 RestartApplications=no
 

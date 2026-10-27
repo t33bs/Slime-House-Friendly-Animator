@@ -1,8 +1,10 @@
 """Slime House Friendly Animator v0.43.0: independent creature animation workshop."""
 import sys
 import math
+import subprocess
+import tempfile
 from pathlib import Path
-from PIL import Image
+from PIL import Image, ImageSequence
 from PySide6.QtCore import Qt, QTimer, Signal, QSettings, QThread, QStandardPaths
 from PySide6.QtGui import QImage, QPixmap, QIcon, QPainter, QPen, QColor, QCursor
 from pathlib import Path
@@ -185,7 +187,7 @@ class UpdateDownloadWorker(QThread):
 class Suite(QMainWindow):
     def __init__(self):
         super().__init__();self.setWindowTitle(f'Slime House Friendly Animator — v{APP_VERSION}');self.resize(1380,850)
-        self.model=PetSuiteModel();self.selected=-1;self.frame=0;self.playframe=0;self.history=EditHistory();self._project_histories={0:self.history};self.advanced=False;self._loading_pose=False;self._pose_draft_key=None;self._pose_draft_dirty=False;self._workspace_frames={};self._workspace_tab_keys=[];self._switching_tab=False;self._active_workspace=None;self._project_name="Untitled Creature";self.settings=QSettings("SlimeHouse", "FriendlyAnimator");self._projects={};self._project_id=0;self._active_project_id=0;self._project_paths={};self._projects[0]=self.model;self._project_labels={0:self._project_name};self._project_frames={0:{}};self._project_views={0:(1.0,0.0,0.0)};self._project_selected={0:-1};self._project_animation={0:next(iter(TEMPLATES))};self._dirty_projects=set();self._saved_fingerprints={0:self.model.content_fingerprint()}
+        self._shs_edit=None;self.model=PetSuiteModel();self.selected=-1;self.frame=0;self.playframe=0;self.history=EditHistory();self._project_histories={0:self.history};self.advanced=False;self._loading_pose=False;self._pose_draft_key=None;self._pose_draft_dirty=False;self._workspace_frames={};self._workspace_tab_keys=[];self._switching_tab=False;self._active_workspace=None;self._project_name="Untitled Creature";self.settings=QSettings("SlimeHouse", "FriendlyAnimator");self._projects={};self._project_id=0;self._active_project_id=0;self._project_paths={};self._projects[0]=self.model;self._project_labels={0:self._project_name};self._project_frames={0:{}};self._project_views={0:(1.0,0.0,0.0)};self._project_selected={0:-1};self._project_animation={0:next(iter(TEMPLATES))};self._dirty_projects=set();self._saved_fingerprints={0:self.model.content_fingerprint()}
         geometry=self.settings.value("window_geometry",None)
         if geometry:self.restoreGeometry(geometry)
         QTimer.singleShot(0,self.ensure_window_visible)
@@ -193,7 +195,7 @@ class Suite(QMainWindow):
         base=QWidget();self.setCentralWidget(base);outer=QVBoxLayout(base)
         top_container=QWidget();top=QHBoxLayout(top_container);top.setContentsMargins(0,0,0,0)
         top_scroll=QScrollArea();top_scroll.setWidget(top_container);top_scroll.setWidgetResizable(True);top_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded);top_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff);top_scroll.setFixedHeight(42);outer.addWidget(top_scroll)
-        for title,callback in [('Import PNG assets',self.import_assets),('Open creature',self.open_project),('New creature',self.new_project),('Save creature',self.save_project),('Export Sprite Sheet',self.export),('Export GIF / APNG',self.export_animated),('Export Frame PNG',self.export_current_frame),('Replace Frame PNG',self.replace_current_frame_png)]:
+        for title,callback in [('Import PNG assets',self.import_assets),('Open creature',self.open_project),('New creature',self.new_project),('Save creature',self.save_project),('Export Sprite Sheet',self.export),('Export GIF / APNG',self.export_animated),('Export Frame PNG',self.export_current_frame),('Edit Frame in SHS',self.edit_frame_in_shs),('Set SHS Location',self.choose_shs_location),('Reload SHS Edit',self.reload_shs_edit),('Replace Frame PNG',self.replace_current_frame_png)]:
             b=QPushButton(title);b.clicked.connect(callback);top.addWidget(b)
         update_button=QPushButton('Check for updates');update_button.clicked.connect(self.check_for_updates);top.addWidget(update_button)
         self.status=QLabel('Welcome! Import PNG parts, pick an animation, and create your first pose.');outer.addWidget(self.status)
@@ -301,13 +303,15 @@ class Suite(QMainWindow):
         self.anim=QComboBox();self.anim.addItems(TEMPLATES);self.anim.currentTextChanged.connect(self.change_anim);ml.addWidget(self.anim)
         self.recipe_toggle=QPushButton('▾ Follow Recipe')
         self.recipe_toggle.setCheckable(True);self.recipe_toggle.setChecked(self.settings.value('recipe_open',True,type=bool))
-        ml.addWidget(self.recipe_toggle)
+        # Legacy recipe controls retained internally for timeline compatibility, but removed from the workspace.
+        self.recipe_toggle.setChecked(False)
+        self.recipe_toggle.hide()
         self.steps=QListWidget();self.steps.setMaximumHeight(105);self.steps.currentRowChanged.connect(self.select_step);ml.addWidget(self.steps)
         self.instruction=QLabel();self.instruction.setWordWrap(True);ml.addWidget(self.instruction)
         self.choose_toggle.toggled.connect(lambda on:(self.anim.setVisible(on),self.settings.setValue('choose_open',on)))
         self.recipe_toggle.toggled.connect(lambda on:(self.steps.setVisible(on),self.instruction.setVisible(on),self.settings.setValue('recipe_open',on)))
         self.anim.setVisible(self.choose_toggle.isChecked())
-        self.steps.setVisible(self.recipe_toggle.isChecked());self.instruction.setVisible(self.recipe_toggle.isChecked())
+        self.steps.hide();self.instruction.hide()
         self.buddy_toggle=QCheckBox('🌱 Slime Buddy ON / OFF');self.buddy_toggle.setChecked(self.settings.value('slime_buddy_enabled',True,type=bool));self.buddy_toggle.setToolTip('Turn all optional Slime Buddy guidance on or off. Your editing tools still work.');ml.addWidget(self.buddy_toggle)
         buddy_row=QHBoxLayout();ml.addLayout(buddy_row)
         self.buddy_station=QComboBox();self.buddy_station.addItems(STATIONS);self.buddy_station.setToolTip('Choose the station you want help with. This never edits your art.');buddy_row.addWidget(self.buddy_station)
@@ -360,10 +364,10 @@ class Suite(QMainWindow):
         right=QWidget();rl=QVBoxLayout(right);rl.addWidget(QLabel('STEP 3 • COMPARE & PREVIEW'))
         buddy_line=QHBoxLayout();rl.addLayout(buddy_line)
         self.buddy_mascot=QLabel();self.buddy_mascot.setFixedSize(56,56)
-        self.buddy_mascot.setPixmap(QPixmap(str(Path(__file__).resolve().parent/'studio'/'assets'/'slime_buddy_16bit.png')).scaled(56,56,Qt.AspectRatioMode.KeepAspectRatio,Qt.TransformationMode.FastTransformation))
+        self.buddy_mascot.setPixmap(QPixmap(str(Path(getattr(sys,'_MEIPASS',Path(__file__).resolve().parent))/'studio'/'assets'/'slime_buddy_16bit.png')).scaled(56,56,Qt.AspectRatioMode.KeepAspectRatio,Qt.TransformationMode.FastTransformation))
         buddy_line.addWidget(self.buddy_mascot)
         self.buddy_bubble=QLabel('SLIME BUDDY\nTips for your tools!');self.buddy_bubble.setWordWrap(True)
-        self.buddy_bubble.setStyleSheet('color:#d8f6cf;background:#263a32;border:2px solid #9bdc8b;padding:6px;font-family:monospace')
+        self.buddy_bubble.setStyleSheet('color:#171d18;background:#f7f7ee;border:3px solid #101510;padding:7px;font-family:monospace;font-weight:bold')
         buddy_line.addWidget(self.buddy_bubble,1)
         self.buddy_dock_toggle=QCheckBox('ON');self.buddy_dock_toggle.setChecked(self.buddy_toggle.isChecked())
         self.buddy_dock_toggle.setToolTip('Turn Slime Buddy guidance on or off. Preference is saved.')
@@ -382,6 +386,37 @@ class Suite(QMainWindow):
         self.desired_label=QLabel('Reference step');self.desired_label.setWordWrap(True);rl.addWidget(self.desired_label)
         self.reference_toggle.toggled.connect(lambda checked:(self.reference_body.setVisible(checked),self.desired.setVisible(checked),self.desired_label.setVisible(checked)))
         for widget in (self.reference_body,self.desired,self.desired_label):widget.setVisible(self.reference_toggle.isChecked())
+        # User-provided animation reference: separate from editing and never included in exports.
+        self.reference_files=[]
+        self.reference_index=0
+        self.reference_timer=QTimer(self)
+        self.reference_timer.timeout.connect(self.advance_uploaded_reference)
+        self.uploaded_reference_toggle=QCheckBox('Show my animation reference')
+        self.uploaded_reference_toggle.setChecked(False)
+        rl.addWidget(self.uploaded_reference_toggle)
+        self.uploaded_reference_panel=QWidget();upl=QVBoxLayout(self.uploaded_reference_panel)
+        upload_buttons=QHBoxLayout();upl.addLayout(upload_buttons)
+        for label,callback in [('Load PNG / GIF / APNG / sheet',self.load_uploaded_reference),('Clear',self.clear_uploaded_reference)]:
+            b=QPushButton(label);b.clicked.connect(callback);upload_buttons.addWidget(b)
+        self.uploaded_reference_image=QLabel('Load an image to use as a visual reference. Not exported.')
+        self.uploaded_reference_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.uploaded_reference_image.setMinimumHeight(145)
+        self.uploaded_reference_image.setStyleSheet('background:#303e3c')
+        upl.addWidget(self.uploaded_reference_image)
+        reference_controls=QHBoxLayout();upl.addLayout(reference_controls)
+        self.reference_play=QPushButton('▶ Play');self.reference_play.setCheckable(True)
+        self.reference_play.toggled.connect(self.toggle_uploaded_reference_play)
+        for label,callback in [('◀',lambda:self.step_uploaded_reference(-1)),('▶',lambda:self.step_uploaded_reference(1))]:
+            b=QPushButton(label);b.clicked.connect(callback);reference_controls.addWidget(b)
+        reference_controls.addWidget(self.reference_play)
+        self.reference_zoom=QSpinBox();self.reference_zoom.setRange(1,8);self.reference_zoom.setValue(2)
+        self.reference_zoom.setPrefix('Zoom ');self.reference_zoom.setSuffix('×')
+        self.reference_zoom.valueChanged.connect(self.render_uploaded_reference)
+        reference_controls.addWidget(self.reference_zoom)
+        self.reference_status=QLabel('No reference loaded');upl.addWidget(self.reference_status)
+        rl.addWidget(self.uploaded_reference_panel)
+        self.uploaded_reference_toggle.toggled.connect(self.uploaded_reference_panel.setVisible)
+        self.uploaded_reference_panel.hide()
         rl.addWidget(QLabel('Your creature • frame preview'))
         preview_zoom_row=QHBoxLayout();rl.addLayout(preview_zoom_row)
         self.preview_zoom=150
@@ -999,7 +1034,14 @@ class Suite(QMainWindow):
         paths,_=QFileDialog.getOpenFileNames(self,'Import creature assets','','PNG (*.png)')
         for path in paths:
             try:
-                im=Image.open(path).convert('RGBA');self.remember();self.model.import_part(Path(path).stem,im)
+                im=Image.open(path).convert('RGBA')
+                cw,ch=self.model.size
+                if im.width>cw or im.height>ch:
+                    answer=QMessageBox.question(self,'Large PNG asset',f'{Path(path).name} is {im.width} × {im.height} pixels, larger than the {cw} × {ch} canvas.\n\nFit inside canvas without cropping? (No keeps original size.)',QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No|QMessageBox.StandardButton.Cancel,QMessageBox.StandardButton.Yes)
+                    if answer==QMessageBox.StandardButton.Cancel:continue
+                    if answer==QMessageBox.StandardButton.Yes:
+                        im.thumbnail((cw,ch),Image.Resampling.NEAREST)
+                self.remember();self.model.import_part(Path(path).stem,im)
                 self.assets.addItem(Path(path).stem)
             except Exception as e:QMessageBox.warning(self,'Import failed',str(e))
         if paths:self.refresh_parent_picker()
@@ -1217,6 +1259,77 @@ class Suite(QMainWindow):
             self.model.render(pose).save(filename,'PNG')
             self.status.setText('Exported transparent frame PNG for editing in Slime House Studios.')
 
+    def choose_shs_location(self):
+        """Let the user choose the installed or portable SHS .exe once."""
+        previous=str(self.settings.value('shs_executable','') or '')
+        start=str(Path(previous).parent) if previous and Path(previous).is_file() else ''
+        exe,_=QFileDialog.getOpenFileName(
+            self,'Select Slime House Studios application',start,
+            'Windows applications (*.exe)')
+        if not exe:
+            return None
+        selected=Path(exe)
+        if selected.suffix.lower()!='.exe' or not selected.is_file():
+            QMessageBox.warning(self,'Invalid SHS application','Please select an existing Windows .exe file.')
+            return None
+        self.settings.setValue('shs_executable',str(selected))
+        self.status.setText(f'SHS application location saved: {selected}')
+        return str(selected)
+
+    def _locate_shs(self):
+        """Reuse the saved application path, or request it from the user."""
+        stored=str(self.settings.value('shs_executable','') or '')
+        if stored and Path(stored).is_file() and Path(stored).suffix.lower()=='.exe':
+            return stored
+        if stored:
+            QMessageBox.information(self,'SHS location changed',
+                'The previously selected SHS application was moved or removed. Please select it again.')
+        return self.choose_shs_location()
+
+    def edit_frame_in_shs(self):
+        """Export one independent frame to a temporary PNG and open it in SHS."""
+        animation=self.anim.currentText()
+        poses=self.model.animations.get(animation,[])
+        if not 0<=self.frame<len(poses):
+            QMessageBox.information(self,'Choose a pose','Save or select a pose first.')
+            return
+        exe=self._locate_shs()
+        if not exe:return
+        work=Path(tempfile.mkdtemp(prefix='friendly_animator_shs_'))
+        png=work/f'frame_{self.frame+1}.png'
+        try:
+            self.model.render(poses[self.frame]).save(png,'PNG')
+            subprocess.Popen([exe,str(png)])
+        except (OSError,ValueError) as exc:
+            QMessageBox.warning(self,'Could not open SHS',str(exc));return
+        self._shs_edit=(str(png),self._active_project_id,animation,self.frame)
+        self.status.setText('Opened frame in SHS. Save the PNG there, then click Reload SHS Edit.')
+
+    def reload_shs_edit(self):
+        """Reload only the originally selected pose, after confirming any context change."""
+        if not self._shs_edit:
+            QMessageBox.information(self,'No SHS edit','Click Edit Frame in SHS first.')
+            return
+        path,project_id,animation,index=self._shs_edit
+        if project_id!=self._active_project_id or animation!=self.anim.currentText() or index!=self.frame:
+            QMessageBox.information(self,'Select original pose','Switch back to the original project, animation, and pose before reloading.')
+            return
+        try:
+            with Image.open(path) as source:edited=source.convert('RGBA')
+            if edited.size!=tuple(self.model.size):
+                QMessageBox.warning(self,'Canvas size mismatch',f'Edited PNG is {edited.size}; expected {self.model.size}. Keep the canvas size unchanged in SHS.')
+                return
+            self.preserve_pose_draft();self.remember()
+            self.model.replace_frame_image(animation,index,edited)
+            self.assets.addItem(self.model.parts[-1]['name'])
+            self._pose_draft_key=(self._active_project_id,animation,index)
+            self._pose_draft_dirty=False
+            self.model.apply_pose(self.model.animations[animation][index])
+            self.assets.setCurrentRow(len(self.model.parts)-1)
+            self.refresh_timeline();self.refresh()
+            self.status.setText(f'Reloaded SHS edit into pose {index+1} only. Main Undo can reverse it.')
+        except (OSError,ValueError) as exc:QMessageBox.warning(self,'Could not reload SHS edit',str(exc))
+
     def replace_current_frame_png(self):
         """Replace only the selected saved pose with an edited full-canvas PNG."""
         animation=self.anim.currentText()
@@ -1248,6 +1361,60 @@ class Suite(QMainWindow):
             self.status.setText(f'Replaced only frame {self.frame+1} from PNG. Main Undo reverses this change.')
         except (OSError,ValueError) as exc:
             QMessageBox.warning(self,'Could not replace frame',str(exc))
+
+    def load_uploaded_reference(self):
+        filename,_=QFileDialog.getOpenFileName(self,'Choose an animation reference','','Images (*.png *.gif *.apng)')
+        if not filename:return
+        from studio.user_reference import read_reference
+        try:
+            columns=rows=None
+            if Path(filename).suffix.lower()=='.png':
+                answer=QMessageBox.question(self,'Sprite sheet?','Is this PNG a sprite sheet with multiple frames?',QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No)
+                if answer==QMessageBox.StandardButton.Yes:
+                    columns,ok=QInputDialog.getInt(self,'Sprite sheet','Number of columns:',4,1,100)
+                    if not ok:return
+                    rows,ok=QInputDialog.getInt(self,'Sprite sheet','Number of rows:',1,1,100)
+                    if not ok:return
+            frames=read_reference(filename,columns,rows)
+        except (OSError,ValueError) as exc:
+            QMessageBox.warning(self,'Cannot open reference',str(exc));return
+        self.reference_timer.stop();self.reference_play.setChecked(False)
+        self.reference_files=frames;self.reference_index=0
+        self.uploaded_reference_toggle.setChecked(True)
+        self.render_uploaded_reference()
+
+    def clear_uploaded_reference(self):
+        self.reference_timer.stop();self.reference_play.setChecked(False)
+        self.reference_files=[];self.reference_index=0
+        self.uploaded_reference_image.clear()
+        self.uploaded_reference_image.setText('Load an image to use as a visual reference. Not exported.')
+        self.reference_status.setText('No reference loaded')
+
+    def render_uploaded_reference(self):
+        if not self.reference_files:return
+        frame,duration=self.reference_files[self.reference_index]
+        zoom=self.reference_zoom.value()
+        rgba=frame.convert('RGBA')
+        data=rgba.tobytes('raw','RGBA')
+        qimage=QImage(data,rgba.width,rgba.height,rgba.width*4,QImage.Format.Format_RGBA8888).copy()
+        scaled=QPixmap.fromImage(qimage).scaled(rgba.width*zoom,rgba.height*zoom,Qt.AspectRatioMode.KeepAspectRatio,Qt.TransformationMode.FastTransformation)
+        self.uploaded_reference_image.setPixmap(scaled)
+        self.reference_status.setText(f'Frame {self.reference_index+1}/{len(self.reference_files)} · {duration} ms · reference only')
+        if self.reference_timer.isActive():self.reference_timer.start(max(20,duration))
+
+    def step_uploaded_reference(self,delta):
+        if not self.reference_files:return
+        self.reference_index=(self.reference_index+delta)%len(self.reference_files)
+        self.render_uploaded_reference()
+
+    def advance_uploaded_reference(self):
+        self.step_uploaded_reference(1)
+
+    def toggle_uploaded_reference_play(self,playing):
+        self.reference_play.setText('Ⅱ Pause' if playing else '▶ Play')
+        if playing and self.reference_files:
+            self.reference_timer.start(max(20,self.reference_files[self.reference_index][1]))
+        else:self.reference_timer.stop()
 
     def refresh_preview(self):
         name=self.anim.currentText()
