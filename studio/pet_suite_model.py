@@ -44,7 +44,7 @@ class PetSuiteModel(CreatureRig):
 
     def render_part(self, index, state):
         """Render a part on a full transparent canvas so its joint stays stationary."""
-        source = self.originals[index]
+        source = self._decode_source(state['source_png']) if state.get('source_png') else self.originals[index]
         w = max(1, int(state.get('width', self.parts[index]['image'].width)))
         h = max(1, int(state.get('height', self.parts[index]['image'].height)))
         part = source.resize((w, h), Image.Resampling.NEAREST)
@@ -246,16 +246,54 @@ class PetSuiteModel(CreatureRig):
         frames[index] = pose
         return deepcopy(pose)
 
+    @staticmethod
+    def _encode_source(image):
+        buffer = io.BytesIO()
+        image.save(buffer, format='PNG')
+        return base64.b64encode(buffer.getvalue()).decode('ascii')
+
+    @staticmethod
+    def _decode_source(encoded):
+        with Image.open(io.BytesIO(base64.b64decode(encoded))) as image:
+            return image.convert('RGBA').copy()
+
     def snapshot(self):
-        return [dict(name=p['name'], x=int(p['x']), y=int(p['y']),
+        return [dict(source_png=self._encode_source(self.originals[i]), name=p['name'], x=int(p['x']), y=int(p['y']),
                      width=p['image'].width, height=p['image'].height, angle=self.angles.get(i, 0),
                      visible=p.get('visible', True)) for i, p in enumerate(self.parts)]
 
+    def replace_frame_image(self, animation, index, image):
+        """Replace one frame with an editable, transparent full-canvas PNG layer.
+
+        Other frames keep their original snapshots. The new layer is only visible
+        in the target frame; it is hidden in the live state of older poses.
+        """
+        frames=self.animations.get(animation,[])
+        if not 0<=index<len(frames):
+            raise IndexError('Choose a saved pose first.')
+        if image.size!=tuple(self.size):
+            raise ValueError('Replacement PNG must match the creature canvas size.')
+        # Import as a new part rather than overwriting any shared source asset.
+        self.import_part(f'Frame {index+1} PNG edit',image)
+        new_index=len(self.parts)-1
+        state=self.snapshot()[new_index]
+        # The replacement is a full frame: old layers must not show through.
+        pose=deepcopy(frames[index])
+        for old in pose:old['visible']=False
+        pose.append(state)
+        frames[index]=pose
+        return new_index
+
     def apply_pose(self, pose):
+        # Newly imported parts must not leak into earlier, shorter pose snapshots.
+        for i in range(len(pose),len(self.parts)):
+            self.parts[i]["visible"]=False
         for i, state in enumerate(pose):
             if i >= len(self.parts):
                 break
             p = self.parts[i]
+            if state.get('source_png'):
+                self.originals[i] = self._decode_source(state['source_png'])
             p['x'], p['y'] = int(state['x']), int(state['y'])
             p['visible'] = state.get('visible', True)
             self.resize_part(i, state.get('width', p['image'].width), state.get('height', p['image'].height))

@@ -192,7 +192,7 @@ class Suite(QMainWindow):
         base=QWidget();self.setCentralWidget(base);outer=QVBoxLayout(base)
         top_container=QWidget();top=QHBoxLayout(top_container);top.setContentsMargins(0,0,0,0)
         top_scroll=QScrollArea();top_scroll.setWidget(top_container);top_scroll.setWidgetResizable(True);top_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded);top_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff);top_scroll.setFixedHeight(54);outer.addWidget(top_scroll)
-        for title,callback in [('Import PNG assets',self.import_assets),('Open creature',self.open_project),('New creature',self.new_project),('Save creature',self.save_project),('Export Sprite Sheet',self.export),('Export GIF / APNG',self.export_animated)]:
+        for title,callback in [('Import PNG assets',self.import_assets),('Open creature',self.open_project),('New creature',self.new_project),('Save creature',self.save_project),('Export Sprite Sheet',self.export),('Export GIF / APNG',self.export_animated),('Export Frame PNG',self.export_current_frame),('Replace Frame PNG',self.replace_current_frame_png)]:
             b=QPushButton(title);b.clicked.connect(callback);top.addWidget(b)
         update_button=QPushButton('Check for updates');update_button.clicked.connect(self.check_for_updates);top.addWidget(update_button)
         self.status=QLabel('Welcome! Import PNG parts, pick an animation, and create your first pose.');outer.addWidget(self.status)
@@ -252,11 +252,15 @@ class Suite(QMainWindow):
         self.slimer_drag_toggle.setToolTip('Use the green square to resize and the blue circle to rotate. Slimer Tool: First highlight pixels in Paint Selection mode. Then click here and drag the highlighted area to move it. Hold Shift while dragging to resize; hold Alt while dragging to rotate. For exact adjustments, use the Slime move X/Y, rotate, and size controls. Click Place Frame or Place as Layer when ready.')
         self.slimer_drag_toggle.toggled.connect(self.slimer_drag_mode)
         ll.addWidget(self.slimer_drag_toggle)
+        self.slimer_finish=QPushButton('✓ Finish Selecting → Move')
+        self.slimer_finish.setToolTip('Finish highlighting. Hide the colored paint and move the selected pixels with a clear outline. Use Edit Selection to adjust the mask.')
+        self.slimer_finish.clicked.connect(lambda:self.slimer_drag_toggle.setChecked(True))
+        ll.addWidget(self.slimer_finish)
         self.slimer_selection_undo=[];self.slimer_selection_redo=[];self._slimer_numeric_replaying=False
         selection_actions=QHBoxLayout();ll.addLayout(selection_actions)
         for label,callback in [('Slimer Undo',self.slimer_undo_selection),('Slimer Redo',self.slimer_redo_selection)]:
             b=QPushButton(label);b.clicked.connect(callback);selection_actions.addWidget(b)
-        self.slimer_copy=QCheckBox('Move Original (clears highlighted pixels from visible layers)');self.slimer_copy.setToolTip('Off (default): copy pixels without changing your original. On: remove selected pixels from visible source layers when placing. Undo restores them.');ll.addWidget(self.slimer_copy)
+        self.slimer_copy=QCheckBox('Move Original (clears highlighted pixels from visible layers)');self.slimer_copy.setChecked(True);self.slimer_copy.setToolTip('On by default: move pixels and clear their old position. Uncheck to COPY the selected pixels instead. Main Undo restores placed changes.');ll.addWidget(self.slimer_copy)
         self.slimer_brush=QSpinBox();self.slimer_brush.setRange(1,32);self.slimer_brush.setValue(1);form.addRow('Slimer brush size',self.slimer_brush)
         self.slimer_dx=QSpinBox();self.slimer_dy=QSpinBox();self.slimer_turn=QSpinBox();self.slimer_scale=QSpinBox()
         for spin in (self.slimer_dx,self.slimer_dy):spin.setRange(-2048,2048)
@@ -287,10 +291,20 @@ class Suite(QMainWindow):
         self.slimer_selection=None
 
         splitter.addWidget(self.scroll_panel(left))
-        middle=QWidget();ml=QVBoxLayout(middle);ml.addWidget(QLabel('STEP 1 • CHOOSE AN ANIMATION & FOLLOW THE RECIPE'))
+        middle=QWidget();ml=QVBoxLayout(middle)
+        self.choose_toggle=QPushButton('▾ Choose Animation')
+        self.choose_toggle.setCheckable(True);self.choose_toggle.setChecked(self.settings.value('choose_open',True,type=bool))
+        ml.addWidget(self.choose_toggle)
         self.anim=QComboBox();self.anim.addItems(TEMPLATES);self.anim.currentTextChanged.connect(self.change_anim);ml.addWidget(self.anim)
+        self.recipe_toggle=QPushButton('▾ Follow Recipe')
+        self.recipe_toggle.setCheckable(True);self.recipe_toggle.setChecked(self.settings.value('recipe_open',True,type=bool))
+        ml.addWidget(self.recipe_toggle)
         self.steps=QListWidget();self.steps.setMaximumHeight(180);self.steps.currentRowChanged.connect(self.select_step);ml.addWidget(self.steps)
         self.instruction=QLabel();self.instruction.setWordWrap(True);ml.addWidget(self.instruction)
+        self.choose_toggle.toggled.connect(lambda on:(self.anim.setVisible(on),self.settings.setValue('choose_open',on)))
+        self.recipe_toggle.toggled.connect(lambda on:(self.steps.setVisible(on),self.instruction.setVisible(on),self.settings.setValue('recipe_open',on)))
+        self.anim.setVisible(self.choose_toggle.isChecked())
+        self.steps.setVisible(self.recipe_toggle.isChecked());self.instruction.setVisible(self.recipe_toggle.isChecked())
         self.buddy_toggle=QCheckBox('🌱 Slime Buddy ON / OFF');self.buddy_toggle.setChecked(self.settings.value('slime_buddy_enabled',True,type=bool));self.buddy_toggle.setToolTip('Turn all optional Slime Buddy guidance on or off. Your editing tools still work.');ml.addWidget(self.buddy_toggle)
         buddy_row=QHBoxLayout();ml.addLayout(buddy_row)
         self.buddy_station=QComboBox();self.buddy_station.addItems(STATIONS);self.buddy_station.setToolTip('Choose the station you want help with. This never edits your art.');buddy_row.addWidget(self.buddy_station)
@@ -300,7 +314,7 @@ class Suite(QMainWindow):
         self.slimer_buddy_tip.setWordWrap(True)
         self.slimer_buddy_tip.setStyleSheet('color:#c7e9c6;background:#30483b;border:1px solid #64866b;border-radius:6px;padding:8px')
         self.slimer_buddy_tip.setToolTip('This tip is optional and appears only while Slime Buddy and Slimer Tool are enabled.')
-        ml.addWidget(self.slimer_buddy_tip)
+        # Slime Buddy guidance lives in the comparison dock, not above the canvas.
         self.check_button=QPushButton('✓ Check animation readiness');self.check_button.setToolTip('Optional technical checks only. Never judges your artwork.');self.check_button.clicked.connect(self.show_technical_checks);ml.addWidget(self.check_button)
         self.buddy_station.currentTextChanged.connect(self.refresh_buddy)
         self.buddy_toggle.toggled.connect(self.refresh_buddy)
@@ -341,12 +355,25 @@ class Suite(QMainWindow):
             button=QPushButton(label);button.setToolTip('Edit the saved poses in this animation. You can undo this change.');button.clicked.connect(callback);timeline_tools.addWidget(button)
         splitter.addWidget(self.scroll_panel(middle))
         right=QWidget();rl=QVBoxLayout(right);rl.addWidget(QLabel('STEP 3 • COMPARE & PREVIEW'))
+        self.buddy_mascot=QLabel('  ▄██▄  SLIME BUDDY\n (•ᴗ•)  ┌──────────────────┐\n  ▀▀   │ Tips for your tools! │\n       └──────────────────┘')
+        self.buddy_mascot.setStyleSheet('color:#a9eeb0;background:#263a32;border:1px solid #739d72;padding:5px;font-family:monospace')
+        rl.addWidget(self.buddy_mascot)
+        rl.addWidget(self.slimer_buddy_tip)
+
         rl.addWidget(QLabel('Generic motion example • synchronized with your poses'))
         self.reference_body=QComboBox();self.reference_body.addItems(['Biped','Quadruped','Floating']);self.reference_body.setToolTip('Pick a simple reference shape. This does not change your creature.');self.reference_body.currentIndexChanged.connect(self.refresh_preview);self.reference_body.currentIndexChanged.connect(self.refresh);rl.addWidget(self.reference_body)
         self.desired=QLabel();self.desired.setAlignment(Qt.AlignmentFlag.AlignCenter);self.desired.setMinimumHeight(135);self.desired.setStyleSheet('background:#303e3c');rl.addWidget(self.desired)
         self.desired_label=QLabel('Reference step');self.desired_label.setWordWrap(True);rl.addWidget(self.desired_label)
         rl.addWidget(QLabel('Your creature • frame preview'))
-        self.preview=QLabel();self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter);self.preview.setMinimumHeight(135);self.preview.setStyleSheet('background:#303e3c');rl.addWidget(self.preview)
+        preview_zoom_row=QHBoxLayout();rl.addLayout(preview_zoom_row)
+        self.preview_zoom=150
+        for text, action in [('−',-50),('+',50),('Fit',0)]:
+            b=QPushButton(text);b.clicked.connect(lambda checked=False,step=action:self.change_preview_zoom(step));preview_zoom_row.addWidget(b)
+
+        self.preview=QLabel();self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter);self.preview.setMinimumSize(150,150);self.preview.setStyleSheet('background:#303e3c')
+        self.preview_scroll=QScrollArea();self.preview_scroll.setWidget(self.preview);self.preview_scroll.setWidgetResizable(False)
+        self.preview_scroll.setMinimumHeight(175);rl.addWidget(self.preview_scroll)
+
         self.play=QPushButton('▶ Play your animation');self.play.setCheckable(True);rl.addWidget(self.play)
         self.play.toggled.connect(self.play_toggled)
         speed_row=QHBoxLayout();rl.addLayout(speed_row);speed_row.addWidget(QLabel('Playback speed'))
@@ -476,6 +503,7 @@ class Suite(QMainWindow):
         self.buddy_details.setVisible(enabled)
         self.pose_tip.setVisible(enabled)
         self.slimer_buddy_tip.setVisible(enabled and self.slimer_toggle.isChecked())
+        if hasattr(self,'buddy_mascot'):self.buddy_mascot.setVisible(enabled)
         if enabled:
             self.buddy_details.setText(station_guide(self.buddy_station.currentText()))
 
@@ -745,7 +773,8 @@ class Suite(QMainWindow):
     def slimer_drag_mode(self,enabled):
         self.canvas.slimer_transform_mode=enabled
         self.canvas.update()
-        self.slimer_drag_toggle.setText('Paint selection (click to switch)' if enabled else 'Drag selected pixels (Shift=resize, Alt=rotate)')
+        self.slimer_drag_toggle.setText('Edit Selection (return to highlighting)' if enabled else 'Drag selected pixels (Shift=resize, Alt=rotate)')
+        self.refresh()
         self.status.setText('Drag to move; hold Shift while dragging to resize, or Alt to rotate.' if enabled else 'Paint with left mouse; erase highlight with right mouse.')
 
     def _slimer_snapshot(self):
@@ -1156,6 +1185,51 @@ class Suite(QMainWindow):
     def canvas_view_changed(self):
         self.zoom_label.setText(f'{round(self.canvas.zoom*100)}%')
         self.canvas.update()
+    def change_preview_zoom(self,step):
+        self.preview_zoom=150 if step==0 else max(50,min(600,self.preview_zoom+step))
+        self.refresh_preview()
+
+    def export_current_frame(self):
+        name=self.anim.currentText()
+        poses=self.model.animations.get(name,[])
+        pose=poses[self.frame] if 0<=self.frame<len(poses) else None
+        filename,_=QFileDialog.getSaveFileName(self,'Export current frame as transparent PNG',f'friendly_frame_{self.frame+1}.png','PNG images (*.png)')
+        if filename:
+            self.model.render(pose).save(filename,'PNG')
+            self.status.setText('Exported transparent frame PNG for editing in Slime House Studios.')
+
+    def replace_current_frame_png(self):
+        """Replace only the selected saved pose with an edited full-canvas PNG."""
+        animation=self.anim.currentText()
+        poses=self.model.animations.get(animation,[])
+        if not 0<=self.frame<len(poses):
+            QMessageBox.information(self,'Choose a frame','Select a saved frame in the Pose Timeline first.')
+            return
+        path,_=QFileDialog.getOpenFileName(self,'Replace current frame from Slime House Studios','','PNG images (*.png)')
+        if not path:return
+        try:
+            with Image.open(path) as opened:
+                edited=opened.convert('RGBA')
+            if edited.size!=tuple(self.model.size):
+                QMessageBox.warning(self,'Frame size mismatch',
+                    f'This PNG is {edited.width} × {edited.height} pixels. The creature canvas is {self.model.size[0]} × {self.model.size[1]}.\n\nExport the frame first and keep its original canvas dimensions when editing in Slime House Studios.')
+                return
+            # Capture the current frame before adding a new independent overlay.
+            # Existing saved poses keep their own source pixels and remain untouched.
+            self.preserve_pose_draft()
+            self.remember()
+            self.model.replace_frame_image(animation,self.frame,edited)
+            self.assets.addItem(self.model.parts[-1]['name'])
+            self._pose_draft_key=(self._active_project_id,animation,self.frame)
+            self._pose_draft_dirty=False
+            self.model.apply_pose(self.model.animations[animation][self.frame])
+            self.assets.setCurrentRow(len(self.model.parts)-1)
+            self.refresh_timeline()
+            self.refresh()
+            self.status.setText(f'Replaced only frame {self.frame+1} from PNG. Main Undo reverses this change.')
+        except (OSError,ValueError) as exc:
+            QMessageBox.warning(self,'Could not replace frame',str(exc))
+
     def refresh_preview(self):
         name=self.anim.currentText()
         poses=self.model.animations.get(name,[])
@@ -1167,7 +1241,8 @@ class Suite(QMainWindow):
             creature_index=self.frame if 0<=self.frame<len(poses) else None
             reference_index=self.frame%reference_count
         pose=poses[creature_index] if creature_index is not None else None
-        self.preview.setPixmap(pixmap(self.model.render(pose),150))
+        self.preview.setPixmap(pixmap(self.model.render(pose),self.preview_zoom))
+        self.preview.resize(max(150,self.preview_zoom),max(150,self.preview_zoom))
         self.desired.setPixmap(pixmap(reference_frame(name,reference_index,body_type=self.reference_body.currentText()),150))
         self.desired_label.setText(f'Example {reference_index+1}/{reference_count} • {TEMPLATES[name][reference_index]} (optional inspiration)')
     def refresh(self):
@@ -1216,10 +1291,10 @@ class Suite(QMainWindow):
                 self.canvas.slimer_bounds=(x0+self.slimer_dx.value(),y0+self.slimer_dy.value(),x1+self.slimer_dx.value(),y1+self.slimer_dy.value())
             composed.alpha_composite(preview)
             marker=Image.new('RGBA',composed.size)
-            marker.putalpha(self.slimer_selection.mask.point(lambda v: 85 if v else 0))
+            marker.putalpha(self.slimer_selection.mask.point(lambda v: 26 if v else 0))
             chosen=QColor(self.slimer_phase_colors.get(self.slimer_phase_picker.currentText(),'#54e88a'))
             tint=Image.new('RGBA',composed.size,(chosen.red(),chosen.green(),chosen.blue(),0));tint.putalpha(marker.getchannel('A'))
-            composed.alpha_composite(tint)
+            if not self.canvas.slimer_transform_mode:composed.alpha_composite(tint)
             data=composed.tobytes('raw','RGBA');image=QImage(data,composed.width,composed.height,composed.width*4,QImage.Format.Format_RGBA8888).copy()
         self.canvas.set_art(QPixmap.fromImage(image))
         self.refresh_preview()
