@@ -7,6 +7,7 @@ import io
 import json
 import math
 import hashlib
+import uuid
 from copy import deepcopy
 from pathlib import Path
 from PIL import Image
@@ -16,6 +17,10 @@ class PetSuiteModel(CreatureRig):
     def __init__(self, size=(128, 128)):
         super().__init__(size)
         self.originals = []
+        # Per-pose recovery is kept separate from live artwork and exports.
+        self.pose_recovery = {}
+        self.pose_recovery_limit = 5
+        self.pose_ids = {}  # Stable identities, independent of timeline positions.
         self.current = 'Idle / Breathing'
         self.frame_durations = {}  # milliseconds per frame, keyed by animation
         self.anchors = {}  # part index -> local anchor (x, y) in source pixels
@@ -50,7 +55,9 @@ class PetSuiteModel(CreatureRig):
         part = source.resize((w, h), Image.Resampling.NEAREST)
         layer = Image.new('RGBA', self.size)
         x, y = int(state['x']), int(state['y'])
-        layer.paste(part, (x, y), part)
+        # Copy source RGBA without applying its alpha twice.
+        # The final render() performs the intended alpha composite once.
+        layer.paste(part, (x, y))
         angle = float(state.get('angle', self.angles.get(index, 0)))
         if angle % 360:
             ax, ay = self.anchors.get(index, [w // 2, h // 2])
@@ -154,11 +161,43 @@ class PetSuiteModel(CreatureRig):
         if axis in ('vertical', 'both'):
             part['y'] = (self.size[1] - part['image'].height) // 2
 
+    def _sync_pose_ids(self, animation):
+        """Ensure legacy timelines receive unique identities without altering pixels."""
+        frames = self.animations.get(animation, [])
+        ids = self.pose_ids.setdefault(animation, [])
+        # Recovery is keyed by pose ID across the entire project, not by
+        # (animation, pose ID). A legacy/corrupt file may reuse an ID in two
+        # different animations; reserve those IDs before repairing this list.
+        seen = {pose_id for other, values in self.pose_ids.items()
+                if other != animation and isinstance(values, list)
+                for pose_id in values if isinstance(pose_id, str) and pose_id}
+        for i in range(len(frames)):
+            if i >= len(ids):
+                ids.append(uuid.uuid4().hex)
+            if not isinstance(ids[i], str) or not ids[i] or ids[i] in seen:
+                ids[i] = uuid.uuid4().hex
+            seen.add(ids[i])
+        del ids[len(frames):]
+        return ids
+
+    def pose_id(self, animation, index):
+        ids = self._sync_pose_ids(animation)
+        if not 0 <= index < len(ids):
+            raise IndexError('Choose an existing timeline pose.')
+        return ids[index]
+
+    def save_frame(self, animation=None):
+        """Append a new pose with its own identity, including the legacy GUI path."""
+        name = animation or self.current
+        return self.insert_frame(name, len(self.animations.get(name, [])))
+
     def insert_frame(self, animation, index, pose=None):
         """Insert an independent editable pose at the requested frame position."""
         frames = self.animations.setdefault(animation, [])
         index = max(0, min(int(index), len(frames)))
+        self._sync_pose_ids(animation)
         frames.insert(index, deepcopy(self.snapshot() if pose is None else pose))
+        self.pose_ids[animation].insert(index, uuid.uuid4().hex)
         self._sync_durations(animation, count=len(frames)-1)
         self.frame_durations[animation].insert(index, self.frame_durations[animation][index-1] if index > 0 and index-1 < len(self.frame_durations[animation]) else 125)
         return index
@@ -175,6 +214,9 @@ class PetSuiteModel(CreatureRig):
             raise IndexError('Choose a saved pose to remove.')
         self._sync_durations(animation)
         self.frame_durations[animation].pop(index)
+        removed_id = self.pose_id(animation, index)
+        self.pose_ids[animation].pop(index)
+        self.pose_recovery.pop(removed_id, None)
         return frames.pop(index)
 
     def move_frame(self, animation, index, direction):
@@ -182,7 +224,9 @@ class PetSuiteModel(CreatureRig):
         destination = index + direction
         if not (0 <= index < len(frames) and 0 <= destination < len(frames)):
             return index
+        ids = self._sync_pose_ids(animation)
         frames[index], frames[destination] = frames[destination], frames[index]
+        ids[index], ids[destination] = ids[destination], ids[index]
         self._sync_durations(animation)
         times = self.frame_durations[animation]
         times[index], times[destination] = times[destination], times[index]
@@ -217,13 +261,41 @@ class PetSuiteModel(CreatureRig):
             position -= duration
         return len(times) - 1
 
+    def _store_pose_recovery(self, animation, index):
+        """Retain an immutable copy before overwriting an existing timeline pose."""
+        frames = self.animations.get(animation, [])
+        if not 0 <= index < len(frames):
+            raise IndexError('Choose an existing pose to edit.')
+        key = self.pose_id(animation, index)
+        versions = self.pose_recovery.setdefault(key, [])
+        versions.append(deepcopy(frames[index]))
+        del versions[:-self.pose_recovery_limit]
+
+    def restore_previous_pose(self, animation, index):
+        """Recover the last saved version without touching any other pose."""
+        key = self.pose_id(animation, index)
+        versions = self.pose_recovery.get(key, [])
+        if not versions:
+            return False
+        frames = self.animations.get(animation, [])
+        if not 0 <= index < len(frames):
+            raise IndexError('Choose an existing pose to recover.')
+        previous = versions.pop()
+        frames[index] = deepcopy(previous)
+        if not versions:
+            self.pose_recovery.pop(key, None)
+        return True
+
     def save_pose_at(self, animation, index):
-        """Save only the selected pose; other poses and animations remain unchanged."""
+        """Save only the selected pose, retaining its previous saved pixels."""
         frames = self.animations.setdefault(animation, [])
         if not 0 <= index < len(frames):
             raise IndexError('Choose an existing pose to edit.')
-        frames[index] = deepcopy(self.snapshot())
-        return frames[index]
+        updated = deepcopy(self.snapshot())
+        if updated != frames[index]:
+            self._store_pose_recovery(animation, index)
+            frames[index] = updated
+        return deepcopy(frames[index])
 
     def edit_pose_at(self, animation, index, changes):
         """Apply per-part geometry to one pose without changing any other pose.
@@ -243,7 +315,9 @@ class PetSuiteModel(CreatureRig):
                 if key in ('width','height') and int(value) < 1:
                     raise ValueError('A part must be at least one pixel in size.')
                 pose[part_index][key] = value
-        frames[index] = pose
+        if pose != frames[index]:
+            self._store_pose_recovery(animation, index)
+            frames[index] = pose
         return deepcopy(pose)
 
     @staticmethod
@@ -281,6 +355,8 @@ class PetSuiteModel(CreatureRig):
         pose=deepcopy(frames[index])
         for old in pose:old['visible']=False
         pose.append(state)
+        if pose != frames[index]:
+            self._store_pose_recovery(animation, index)
         frames[index]=pose
         return new_index
 
@@ -372,7 +448,12 @@ class PetSuiteModel(CreatureRig):
         for i, image in enumerate(self.originals):
             image.save(folder / f'original_{i:03d}.png')
         data = dict(version=2, size=list(self.size), parts=self.snapshot(),
-                    animations=self.animations, frame_durations=self.frame_durations, current=self.current, attachments=self.attachments, anchors=self.anchors, angles=self.angles)
+                    animations=self.animations, frame_durations=self.frame_durations,
+                    pose_ids={name: self._sync_pose_ids(name)[:] for name in self.animations},
+                    pose_recovery={pose_id: deepcopy(history[-self.pose_recovery_limit:])
+                                   for pose_id, history in self.pose_recovery.items()
+                                   if history and any(pose_id in ids for ids in self.pose_ids.values())},
+                    current=self.current, attachments=self.attachments, anchors=self.anchors, angles=self.angles)
         path.write_text(json.dumps(data, indent=2), encoding='utf-8')
 
     @classmethod
@@ -392,6 +473,15 @@ class PetSuiteModel(CreatureRig):
             model.parts[-1]['y'] = int(state['y'])
             model.parts[-1]['visible'] = state.get('visible', True)
         model.animations = data.get('animations', {})
+        model.pose_ids = data.get('pose_ids', {})
+        for animation in model.animations: model._sync_pose_ids(animation)
+        valid_ids = {pose_id for ids in model.pose_ids.values() for pose_id in ids}
+        raw_recovery = data.get('pose_recovery', {})
+        if isinstance(raw_recovery, dict):
+            model.pose_recovery = {pose_id: deepcopy(history[-model.pose_recovery_limit:])
+                                   for pose_id, history in raw_recovery.items()
+                                   if pose_id in valid_ids and isinstance(history, list)
+                                   and all(isinstance(pose, list) for pose in history)}
         model.frame_durations = data.get('frame_durations', {})
         for animation in model.animations: model._sync_durations(animation)
         model.current = data.get('current', 'Idle / Breathing')

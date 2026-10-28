@@ -47,7 +47,7 @@ class SlimerSelection:
             piece = piece.resize((w, h), Image.Resampling.NEAREST)
         if angle % 360:
             piece = piece.rotate(float(angle), Image.Resampling.NEAREST, expand=True)
-        preview.paste(piece, (bounds[0]+int(dx), bounds[1]+int(dy)), piece)
+        preview.paste(piece, (bounds[0]+int(dx), bounds[1]+int(dy)))
         return preview
 
     def compose(self, preview, move_original=False):

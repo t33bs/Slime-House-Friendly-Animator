@@ -40,6 +40,8 @@ class DragCanvas(QLabel):
     anchor_chosen=Signal(int,int)
     angle_chosen=Signal(float)
     view_changed=Signal()
+    cleaner_stroke=Signal(int,int)
+    cleaner_stroke_start=Signal()
     slimer_stroke=Signal(int,int,bool)
     slimer_stroke_start=Signal()
     slimer_drag=Signal(int,int,str)
@@ -49,7 +51,7 @@ class DragCanvas(QLabel):
         super().__init__();self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMouseTracking(True);self._last=None;self._image_size=(128,128)
         self.parts=[];self.selected=-1;self._action=None;self.anchor_mode=False;self.anchors={};self.angles={}
-        self.zoom=1.0;self.pan_x=0.0;self.pan_y=0.0;self._pan_last=None;self._art=None;self.slimer_active=False;self._slimer_painting=False;self.slimer_transform_mode=False;self._slimer_last=None;self.slimer_bounds=None;self._slimer_handle=None
+        self.zoom=1.0;self.pan_x=0.0;self.pan_y=0.0;self._pan_last=None;self._art=None;self.slimer_active=False;self.cleaner_active=False;self._cleaner_painting=False;self._slimer_painting=False;self.slimer_transform_mode=False;self._slimer_last=None;self.slimer_bounds=None;self._slimer_handle=None
     def _geometry(self):
         return canvas_geometry(self.width(),self.height(),*self._image_size,self.zoom,self.pan_x,self.pan_y)
     def _pixel(self,pos):
@@ -100,6 +102,12 @@ class DragCanvas(QLabel):
         self.zoom=1.0;self.pan_x=0.0;self.pan_y=0.0
         self.update();self.view_changed.emit()
     def mousePressEvent(self,event):
+        if self.cleaner_active and event.button()==Qt.MouseButton.LeftButton and not (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            x,y=self._pixel(event.position())
+            self._cleaner_painting=True
+            self.cleaner_stroke_start.emit()
+            self.cleaner_stroke.emit(int(x),int(y))
+            event.accept();return
         if self.slimer_active and event.button() in (Qt.MouseButton.LeftButton,Qt.MouseButton.RightButton) and not (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
             x,y=self._pixel(event.position())
             if self.slimer_transform_mode and event.button()==Qt.MouseButton.LeftButton:
@@ -135,6 +143,10 @@ class DragCanvas(QLabel):
             if not self._action:self._last=None
         super().mousePressEvent(event)
     def mouseMoveEvent(self,event):
+        if self._cleaner_painting:
+            x,y=self._pixel(event.position())
+            self.cleaner_stroke.emit(int(x),int(y))
+            event.accept();return
         if self.slimer_active and self._slimer_last is not None:
             x,y=self._pixel(event.position());dx=round(x-self._slimer_last[0]);dy=round(y-self._slimer_last[1])
             if dx or dy:
@@ -162,7 +174,7 @@ class DragCanvas(QLabel):
                 self._last=(self._last[0]+dx,self._last[1]+dy)
         super().mouseMoveEvent(event)
     def mouseReleaseEvent(self,event):
-        self._last=None;self._action=None;self._pan_last=None;self._slimer_painting=False;self._slimer_last=None;self._slimer_handle=None;self.slimer_drag_end.emit();super().mouseReleaseEvent(event)
+        self._last=None;self._action=None;self._pan_last=None;self._slimer_painting=False;self._cleaner_painting=False;self._slimer_last=None;self._slimer_handle=None;self.slimer_drag_end.emit();super().mouseReleaseEvent(event)
 
 class UpdateCheckWorker(QThread):
     result = Signal(object, str)
@@ -265,7 +277,14 @@ class Suite(QMainWindow):
         selection_actions=QHBoxLayout();ll.addLayout(selection_actions)
         for label,callback in [('Slimer Undo',self.slimer_undo_selection),('Slimer Redo',self.slimer_redo_selection)]:
             b=QPushButton(label);b.clicked.connect(callback);selection_actions.addWidget(b)
-        self.slimer_copy=QCheckBox('Move Original (clears highlighted pixels from visible layers)');self.slimer_copy.setChecked(True);self.slimer_copy.setToolTip('On by default: move pixels and clear their old position. Uncheck to COPY the selected pixels instead. Main Undo restores placed changes.');ll.addWidget(self.slimer_copy)
+        ll.addWidget(QLabel('SLIME CLEANER • erase pixels to transparency'))
+        self.cleaner_toggle=QPushButton('Activate Slime Cleaner')
+        self.cleaner_toggle.setCheckable(True)
+        self.cleaner_toggle.setToolTip('Independent eraser. Left-drag to clear pixels on the current pose. Undo restores a stroke. Slimer never automatically erases originals.')
+        self.cleaner_toggle.toggled.connect(self.cleaner_toggle_mode)
+        ll.addWidget(self.cleaner_toggle)
+        self.cleaner_brush=QSpinBox();self.cleaner_brush.setRange(1,32);self.cleaner_brush.setValue(1)
+        form.addRow('Cleaner brush size',self.cleaner_brush)
         self.slimer_brush=QSpinBox();self.slimer_brush.setRange(1,32);self.slimer_brush.setValue(1);form.addRow('Slimer brush size',self.slimer_brush)
         self.slimer_dx=QSpinBox();self.slimer_dy=QSpinBox();self.slimer_turn=QSpinBox();self.slimer_scale=QSpinBox()
         for spin in (self.slimer_dx,self.slimer_dy):spin.setRange(-2048,2048)
@@ -328,7 +347,7 @@ class Suite(QMainWindow):
         self.buddy_toggle.toggled.connect(lambda enabled:self.settings.setValue("slime_buddy_enabled",enabled))
         self.refresh_buddy()
         ml.addWidget(QLabel('STEP 2 • BUILD YOUR POSE — DRAG PARTS ON THE CANVAS'))
-        self.canvas=DragCanvas();self.canvas.slimer_stroke.connect(self.slimer_paint);self.canvas.slimer_stroke_start.connect(self.slimer_start_stroke);self.canvas.slimer_drag.connect(self.slimer_drag_transform);self.canvas.slimer_drag_start.connect(self.slimer_start_transform);self.canvas.slimer_drag_end.connect(self.slimer_end_transform);self.canvas.moved.connect(self.drag_part);self.canvas.resized.connect(self.resize_drag);self.canvas.picked.connect(self.assets.setCurrentRow);self.canvas.anchor_chosen.connect(self.place_anchor);self.canvas.angle_chosen.connect(self.turn_part);self.canvas.setMinimumHeight(380);self.canvas.setStyleSheet('background:#303e3c;border:1px solid #64866b');ml.addWidget(self.canvas,1);self.canvas.setToolTip('Click a part to select. Drag to move, use the green corner to resize, or drag the blue circle to turn.')
+        self.canvas=DragCanvas();self.canvas.cleaner_stroke.connect(self.cleaner_paint);self.canvas.cleaner_stroke_start.connect(self.cleaner_start_stroke);self.canvas.slimer_stroke.connect(self.slimer_paint);self.canvas.slimer_stroke_start.connect(self.slimer_start_stroke);self.canvas.slimer_drag.connect(self.slimer_drag_transform);self.canvas.slimer_drag_start.connect(self.slimer_start_transform);self.canvas.slimer_drag_end.connect(self.slimer_end_transform);self.canvas.moved.connect(self.drag_part);self.canvas.resized.connect(self.resize_drag);self.canvas.picked.connect(self.assets.setCurrentRow);self.canvas.anchor_chosen.connect(self.place_anchor);self.canvas.angle_chosen.connect(self.turn_part);self.canvas.setMinimumHeight(380);self.canvas.setStyleSheet('background:#303e3c;border:1px solid #64866b');ml.addWidget(self.canvas,1);self.canvas.setToolTip('Click a part to select. Drag to move, use the green corner to resize, or drag the blue circle to turn.')
         nav=QHBoxLayout();ml.addLayout(nav)
         nav.addWidget(QLabel('Canvas view:'))
         fit=QPushButton('Fit to Canvas');fit.setToolTip('Show the whole creature again (does not resize your artwork).');fit.clicked.connect(self.canvas.reset_view);nav.addWidget(fit)
@@ -355,7 +374,7 @@ class Suite(QMainWindow):
         self.duration.setToolTip('Shorter means faster movement. Try 125 ms to start!')
         self.duration.valueChanged.connect(self.change_duration);timing.addWidget(self.duration);timing.addStretch(1)
         actions=QHBoxLayout();ml.addLayout(actions)
-        for label,callback in [('Save / replace this frame',self.save_frame),('Duplicate last frame',self.duplicate_frame),('Previous frame',self.prev_frame),('Next frame',self.next_frame)]:
+        for label,callback in [('Save Current Pose',self.save_frame),('Restore Previous Pose',self.restore_previous_timeline_pose),('Duplicate last frame',self.duplicate_frame),('Previous frame',self.prev_frame),('Next frame',self.next_frame)]:
             b=QPushButton(label);b.clicked.connect(callback);actions.addWidget(b)
         timeline_tools=QHBoxLayout();ml.addLayout(timeline_tools)
         for label,callback in [('➕ Add pose',self.insert_pose),('📋 Copy pose',self.copy_pose),('🗑 Remove pose',self.remove_pose),('← Shift pose',lambda:self.shift_pose(-1)),('Shift pose →',lambda:self.shift_pose(1))]:
@@ -805,7 +824,25 @@ class Suite(QMainWindow):
         self.slimer_phase_picker.addItem(name)
         self.slimer_phase_picker.setCurrentText(name)
 
+    def cleaner_toggle_mode(self,enabled):
+        self.canvas.cleaner_active=enabled
+        if enabled and self.slimer_toggle.isChecked():
+            self.slimer_toggle.setChecked(False)
+        self.canvas.setCursor(Qt.CursorShape.CrossCursor if enabled else Qt.CursorShape.ArrowCursor)
+        self.status.setText('Slime Cleaner: left-drag to erase pixels; Undo restores a stroke.' if enabled else 'Slime Cleaner off.')
+        self.refresh()
+
+    def cleaner_start_stroke(self):
+        self.remember()  # One undo snapshot for the complete brush stroke.
+
+    def cleaner_paint(self,x,y):
+        from studio.slime_cleaner import erase_visible_pixels
+        erase_visible_pixels(self.model.parts,x,y,self.cleaner_brush.value())
+        self.refresh()
+
     def slimer_toggle_mode(self,enabled):
+        if enabled and self.cleaner_toggle.isChecked():
+            self.cleaner_toggle.setChecked(False)
         self.canvas.slimer_active=enabled
         self.canvas.setCursor(self._slimer_cursor() if enabled else Qt.CursorShape.ArrowCursor)
         self.canvas.anchor_mode=False if enabled else self.canvas.anchor_mode
@@ -950,23 +987,84 @@ class Suite(QMainWindow):
         selection=self.slimer_selection
         if selection is None or selection.mask.getbbox() is None:
             self.status.setText('Highlight some pixels with the Slimer brush first.');return
+        # Commit the current pose BEFORE adding a new part. Otherwise an active
+        # draft can accidentally save the new Slimer layer into the previous pose.
+        if as_frame:
+            self.preserve_pose_draft()
         self.remember()  # A complete placement, including new layer/frame, is ONE undo step.
-        if self.slimer_copy.isChecked():
-            self._slimer_erase_original_layers(selection.mask)
-        result=self.slimer_preview()  # Transparent new layer; do not duplicate the entire creature.
-        self.model.import_part('Slimer pose' if as_frame else 'Slimer layer',result)
-        self.assets.addItem(self.model.parts[-1]['name'])
-        self.assets.setCurrentRow(len(self.model.parts)-1)
+        result=self.slimer_preview()  # Selected pixels only, not the full creature.
+        if as_frame:
+            # Reuse the dedicated Slimer overlay layer instead of appending a
+            # second/third/etc. "Slimer pose" asset on every Place Frame click.
+            # Pose snapshots contain their own source_png, so changing this
+            # layer's source for the NEW frame cannot rewrite an older frame.
+            overlay_index=next((i for i,p in enumerate(self.model.parts)
+                if p.get('name') == 'Slimer pose overlay'), None)
+            if overlay_index is None:
+                self.model.import_part('Slimer pose overlay', result)
+                overlay_index=len(self.model.parts)-1
+                self.assets.addItem(self.model.parts[-1]['name'])
+            else:
+                from PIL import Image
+                # An overlay hidden by apply_pose() belongs to another pose.
+                # Never resurrect its cached pixels in the current frame.
+                if self.model.parts[overlay_index].get('visible', True):
+                    old_layer=self.model.originals[overlay_index].convert('RGBA').copy()
+                else:
+                    old_layer=Image.new('RGBA', self.model.size)
+                if old_layer.size != tuple(self.model.size):
+                    old_layer=old_layer.resize(self.model.size,Image.Resampling.NEAREST)
+                # The selected pixels are placed on the existing transparent
+                # overlay; previous selections in this pose remain visible.
+                # Pixel-art placements must be idempotent. Alpha-compositing a
+                # semi-transparent selected pixel repeatedly increases opacity
+                # and can corrupt the exact RGBA value. Replace only pixels
+                # actually selected, preserving their original alpha.
+                placed=result.convert('RGBA')
+                selection_mask=placed.getchannel('A').point(lambda a: 255 if a else 0)
+                merged=old_layer.copy()
+                merged.paste(placed,(0,0),selection_mask)  # binary mask copies exact RGBA
+                self.model.originals[overlay_index]=merged.copy()
+                self.model.parts[overlay_index]['image']=merged.copy()
+                self.model.parts[overlay_index]['x']=0
+                self.model.parts[overlay_index]['y']=0
+                self.model.parts[overlay_index]['visible']=True
+                self.model.angles[overlay_index]=0
+            self.assets.setCurrentRow(overlay_index)
+        else:
+            self.model.import_part('Slimer layer',result)
+            self.assets.addItem(self.model.parts[-1]['name'])
+            self.assets.setCurrentRow(len(self.model.parts)-1)
         if as_frame:
             name=self.anim.currentText()
+            # The previous frame is already finalized. The new part exists only
+            # in the new frame snapshot, not in the older pose's saved state.
             index=self.model.insert_frame(name,self.frame+1)
+            self._pose_draft_dirty=False
             self.select_timeline_pose(index)
+        self.sync_slimer_asset_labels()
         self.slimer_clear()
-        self.status.setText('Slimer placement complete. Main Undo reverses the placement (including Move Original).')
+        self.status.setText('Slimer placement complete. Original pixels were preserved; use Slime Cleaner to erase deliberately.')
         self.refresh()
 
     def slimer_place_layer(self):self._slimer_commit(False)
-    def slimer_place_frame(self):self._slimer_commit(True)
+    def slimer_place_frame(self):
+        """Create a new pose even when no pixels have been highlighted.
+
+        A plain Place Frame is a snapshot, not a destructive Slimer move.
+        """
+        if not self.model.parts:
+            QMessageBox.warning(self,'No artwork','Import creature artwork first.')
+            return
+        if self.slimer_selection is None or self.slimer_selection.mask.getbbox() is None:
+            self.preserve_pose_draft()
+            self.remember()
+            name=self.anim.currentText()
+            index=self.model.insert_frame(name,self.frame+1)
+            self.select_timeline_pose(index)
+            self.status.setText(f'Placed independent pose {index+1} without changing artwork.')
+            return
+        self._slimer_commit(True)
 
     def remember(self):
         self.history.record(self.model)
@@ -1114,21 +1212,83 @@ class Suite(QMainWindow):
 
     def change_anim(self,name):
         self.elapsed_ms=0
+        previous_animation=self.model.current
         self.preserve_pose_draft()
         self._pose_draft_key=None
         self.model.current=name
         if hasattr(self,'workspace_tabs') and not self._switching_tab:
             self.select_workspace_key(('animation',name))
-        self.steps.clear()
-        for i,step in enumerate(TEMPLATES[name]):self.steps.addItem(f'{i+1}. {step}')
-        self.steps.setCurrentRow(0);self.refresh_timeline()
+        # Rebuilding the step list used to emit currentRowChanged while the
+        # destination animation was only half-loaded. That re-entered
+        # select_step(), potentially mixing the old canvas with the new pose.
+        self.steps.blockSignals(True)
+        try:
+            self.steps.clear()
+            for i,step in enumerate(TEMPLATES[name]):
+                self.steps.addItem(f'{i+1}. {step}')
+            self.steps.setCurrentRow(0)
+        finally:
+            self.steps.blockSignals(False)
+        poses=self.model.animations.get(name,[])
+        if poses:
+            self.select_step(0)
+        else:
+            # No saved destination pose exists. Keep shared creature base art,
+            # but never show a Slimer overlay from the previous animation.
+            # Existing saved snapshots own their own overlay pixels, so hiding
+            # the live layer here does not alter any saved timeline pose.
+            self._pose_draft_key=None
+            self.frame=0
+            if previous_animation != name:
+                for part in self.model.parts:
+                    if part.get('name') == 'Slimer pose overlay':
+                        part['visible'] = False
+        if previous_animation != name:
+            # The destination has now been applied (if saved), so derive the
+            # fresh Slimer source from the destination rather than the old pose.
+            self._reset_slimer_for_project_change()
+        if not poses:
+            self.refresh()
+        self.refresh_timeline()
     def select_step(self,index):
         if index<0:return
-        self.begin_pose_draft(self.anim.currentText(),index)
-        self.frame=index;self.instruction.setText(f'Frame {index+1}: {TEMPLATES[self.anim.currentText()][index % len(TEMPLATES[self.anim.currentText()])]}. Drag parts to move, green corner to resize, blue circle to turn. Then save this pose.')
-        poses=self.model.animations.get(self.anim.currentText(),[])
+        animation=self.anim.currentText()
+        previous_key=self._pose_draft_key
+        next_key=(self._active_project_id,animation,index)
+        changing_pose=previous_key is not None and previous_key != next_key
+        self.begin_pose_draft(animation,index)
+        self.frame=index
+        self.instruction.setText(f'Frame {index+1}: {TEMPLATES[animation][index % len(TEMPLATES[animation])]}. Drag parts to move, green corner to resize, blue circle to turn. Then save this pose.')
+        poses=self.model.animations.get(animation,[])
         if index<len(poses):self.model.apply_pose(poses[index]);self.select_asset(self.selected)
+        if changing_pose:
+            self._reset_slimer_for_project_change()
         self.refresh()
+    def sync_slimer_asset_labels(self):
+        """Number the Slimer overlay by its selected timeline pose, not by layer count.
+
+        The canonical model layer name remains unchanged: the UI label is only a
+        presentation of the active pose. This avoids using mutable display names
+        as layer identifiers and does not rewrite saved pose snapshots.
+        """
+        if not hasattr(self, 'assets'):
+            return
+        animation = self.anim.currentText()
+        poses = self.model.animations.get(animation, [])
+        number = self.frame + 1 if 0 <= self.frame < len(poses) else None
+        for index, part in enumerate(self.model.parts):
+            if index >= self.assets.count():
+                break
+            canonical = part.get('name', '')
+            if canonical == 'Slimer pose overlay':
+                # A pose predating this layer must not claim ownership of it.
+                owned = (number is not None and index < len(poses[self.frame])
+                         and poses[self.frame][index].get('visible', True))
+                label = f'Slimer Pose {number:03d}' if owned else 'Slimer pose overlay (not in this pose)'
+            else:
+                label = canonical
+            self.assets.item(index).setText(label)
+
     def refresh_timeline(self):
         if not hasattr(self,'timeline'):return
         self.timeline.blockSignals(True);self.timeline.clear()
@@ -1145,29 +1305,102 @@ class Suite(QMainWindow):
                 item.setToolTip(f'Preview unavailable: {exc}')
             self.timeline.addItem(item)
         self.timeline.blockSignals(False)
+        self.sync_slimer_asset_labels()
         if 0 <= self.frame < self.timeline.count():
             self.timeline.setCurrentRow(self.frame)
     def load_frame(self,index):
         self.elapsed_ms=0
-        poses=self.model.animations.get(self.anim.currentText(),[])
+        animation=self.anim.currentText()
+        poses=self.model.animations.get(animation,[])
         if 0<=index<len(poses):
-            self.begin_pose_draft(self.anim.currentText(),index)
+            # An unfinished selection is derived from one pose's pixels. It
+            # must never be replayed on another pose, even when Slimer remains
+            # the active tool. A same-pose refresh should not discard it.
+            previous_key=self._pose_draft_key
+            next_key=(self._active_project_id,animation,index)
+            changing_pose=previous_key is not None and previous_key != next_key
+            self.begin_pose_draft(animation,index)
             self.frame=index;self.model.apply_pose(poses[index]);self.select_asset(self.selected)
-            self.duration.blockSignals(True);self.duration.setValue(self.model.frame_duration(self.anim.currentText(),index));self.duration.blockSignals(False)
-            self.steps.setCurrentRow(min(index,self.steps.count()-1));self.refresh()
+            if changing_pose:
+                self._reset_slimer_for_project_change()
+            self.duration.blockSignals(True);self.duration.setValue(self.model.frame_duration(animation,index));self.duration.blockSignals(False)
+            self.steps.setCurrentRow(min(index,self.steps.count()-1));self.sync_slimer_asset_labels();self.refresh()
     def save_frame(self):
-        if not self.model.parts:QMessageBox.warning(self,'No assets','Import creature parts first.');return
+        """Save only an existing selected pose; never create frames implicitly."""
+        if not self.model.parts:
+            QMessageBox.warning(self,'No assets','Import creature parts first.')
+            return
+        name=self.anim.currentText()
+        poses=self.model.animations.get(name,[])
+        if not 0 <= self.frame < len(poses):
+            QMessageBox.information(self,'No selected pose','Use Place Frame to create a pose first.')
+            return
         self.remember()
-        name=self.anim.currentText();poses=self.model.animations.setdefault(name,[])
-        while len(poses)<=self.frame:poses.append(self.model.snapshot())
-        poses[self.frame]=self.model.snapshot();self._pose_draft_key=(self._active_project_id,name,self.frame);self._pose_draft_dirty=False;self.model._sync_durations(name);self.refresh_timeline();self.status.setText(f'Saved {name} frame {self.frame+1}.');self.refresh()
-    def duplicate_frame(self):
-        self.remember()
-        name=self.anim.currentText();poses=self.model.animations.setdefault(name,[])
-        poses.append(self.model.snapshot());self.model._sync_durations(name);self.refresh_timeline();self.status.setText(f'Duplicated pose in {name} ({len(poses)} saved frames).');self.refresh()
-    def select_timeline_pose(self,index):
+        self.model.save_pose_at(name,self.frame)
+        self._pose_draft_key=(self._active_project_id,name,self.frame)
+        self._pose_draft_dirty=False
         self.refresh_timeline()
+        self.status.setText(f'Saved {name} pose {self.frame+1} without changing other poses.')
+        self.refresh()
+    def restore_previous_timeline_pose(self):
+        """Restore only the selected saved pose, then reload its canvas and thumbnail."""
+        name = self.anim.currentText()
+        index = self.timeline.currentRow()
+        poses = self.model.animations.get(name, [])
+        if not 0 <= index < len(poses):
+            QMessageBox.information(self, 'No selected pose', 'Select a saved timeline pose first.')
+            return
+        pose_id = self.model.pose_id(name, index)
+        if not self.model.pose_recovery.get(pose_id):
+            QMessageBox.information(self, 'No previous version', 'This pose has no earlier saved version to restore.')
+            return
+        # A restore deliberately discards the current unsaved draft. Do not
+        # allow load_frame() to auto-save it over the recovered snapshot.
+        self.remember()
+        self._pose_draft_dirty = False
+        if not self.model.restore_previous_pose(name, index):
+            return
+        self._pose_draft_key = None
+        self.select_timeline_pose(index)
+        # The recovered pose is now the only valid selection source. A Slimer
+        # selection made against the discarded version must not be replayed.
+        # Keep the Slimer tool active, but clear its transient selection state.
+        self._reset_slimer_for_project_change()
+        self.refresh()
+        self.status.setText(f'Restored previous version of {name} pose {index+1}. Save Creature to keep this recovery on disk.')
+
+    def duplicate_frame(self):
+        """Append an independent snapshot through the identity-safe model API."""
+        self.preserve_pose_draft()
+        if not self.model.parts:
+            QMessageBox.warning(self, 'No artwork', 'Import creature artwork first.')
+            return
+        name = self.anim.currentText()
+        frames = self.model.animations.get(name, [])
+        if not frames:
+            QMessageBox.information(self, 'No pose to duplicate', 'Use Place Frame to create your first timeline pose.')
+            return
+        self.remember()
+        # Duplicate the selected saved snapshot, not whatever temporary Slimer
+        # overlay happens to be visible on the working canvas.
+        source_index = min(max(self.frame, 0), len(frames) - 1)
+        index = self.model.copy_frame(name, source_index)
+        self._pose_draft_key = None
+        self.select_timeline_pose(index)
+        self.status.setText(f'Duplicated pose {source_index + 1} as pose {index + 1} in {name}.')
+    def select_timeline_pose(self,index):
+        """Load the requested pose even if the row number did not change.
+
+        A new frame inserted at the same row index as the previously selected
+        frame must still load its own snapshot and update the draft identity.
+        """
+        self.refresh_timeline()
+        if not 0 <= index < self.timeline.count():
+            return
+        self.timeline.blockSignals(True)
         self.timeline.setCurrentRow(index)
+        self.timeline.blockSignals(False)
+        self.load_frame(index)
 
     def insert_pose(self):
         self.preserve_pose_draft()
@@ -1195,7 +1428,21 @@ class Suite(QMainWindow):
         if not frames:return
         self.remember()
         self.model.delete_frame(self.anim.currentText(),min(self.frame,len(frames)-1))
-        self.select_timeline_pose(min(self.frame,len(frames)-2)) if len(frames)>0 else self.refresh_timeline()
+        if frames:
+            # Load the surviving snapshot; never leave the deleted pose active.
+            self.select_timeline_pose(min(self.frame, len(frames)-1))
+        else:
+            # Deleting the final pose must not leave its Slimer overlay visible
+            # as if it were still saved in the empty timeline.
+            self.frame = 0
+            self._pose_draft_key = None
+            self._pose_draft_dirty = False
+            for part in self.model.parts:
+                if part.get('name') == 'Slimer pose overlay':
+                    part['visible'] = False
+            self._reset_slimer_for_project_change()
+            self.refresh_timeline()
+            self.refresh()
         self.status.setText('Pose removed. Use Undo if you change your mind.')
 
     def shift_pose(self,direction):
@@ -1488,12 +1735,46 @@ class Suite(QMainWindow):
         self.pose_tip.setVisible(self.buddy_toggle.isChecked())
         self.pose_tip.setText("💡 " + motion_tip(self.anim.currentText(),self.frame,self.reference_body.currentText()) if self.buddy_toggle.isChecked() else '')
 
+    def _reset_slimer_for_project_change(self):
+        """Discard transient selection state, never project artwork or saved poses.
+
+        The Slimer tool may stay selected across creature tabs. Its source image,
+        masks, drag state and transform controls must not survive that boundary.
+        """
+        self.slimer_selection_undo.clear()
+        self.slimer_selection_redo.clear()
+        self.slimer_phase_masks={}
+        self._slimer_current_phase=self.slimer_phase_picker.currentText()
+        self._slimer_mouse_transforming=False
+        self.canvas._slimer_painting=False
+        self.canvas._slimer_last=None
+        self.canvas._slimer_handle=None
+        self.canvas.slimer_bounds=None
+        self.canvas.slimer_transform_mode=False
+        self.slimer_drag_toggle.blockSignals(True)
+        self.slimer_drag_toggle.setChecked(False)
+        self.slimer_drag_toggle.blockSignals(False)
+        self.slimer_drag_toggle.setText('Drag selected pixels (Shift=resize, Alt=rotate)')
+        for control,value in ((self.slimer_dx,0),(self.slimer_dy,0),
+                              (self.slimer_turn,0),(self.slimer_scale,100)):
+            control.blockSignals(True)
+            control.setValue(value)
+            control.blockSignals(False)
+        self.slimer_selection=(SlimerSelection.empty(self.model.render())
+                               if self.slimer_toggle.isChecked() else None)
+        self._slimer_sync_numeric_values()
+
     def activate_project(self,project_id):
         if project_id not in self._projects:return
         self.preserve_pose_draft()
         self._pose_draft_key=None
         if project_id==self._active_project_id:return
         self._projects[self._active_project_id]=self.model
+        # Remember the selected timeline index independently for each creature.
+        # Project tabs must not inherit another creature's active pose number.
+        if not hasattr(self, '_project_timeline_index'):
+            self._project_timeline_index = {}
+        self._project_timeline_index[self._active_project_id] = self.frame
         self._project_frames[self._active_project_id]=dict(self._workspace_frames)
         self._project_selected[self._active_project_id]=self.selected
         self._project_animation[self._active_project_id]=self.anim.currentText()
@@ -1514,8 +1795,36 @@ class Suite(QMainWindow):
         self.anim.blockSignals(True)
         self.anim.setCurrentText(self._project_animation.get(project_id,self.model.current) if self._project_animation.get(project_id,self.model.current) in TEMPLATES else next(iter(TEMPLATES)))
         self.anim.blockSignals(False)
-        self.steps.clear()
-        for i,step in enumerate(TEMPLATES[self.anim.currentText()]):self.steps.addItem(f'{i+1}. {step}')
+        # Build the destination list without firing a selection event against
+        # the previous creature's canvas. Apply the destination's saved pixels
+        # BEFORE Slimer captures its new selection source.
+        self.steps.blockSignals(True)
+        try:
+            self.steps.clear()
+            for i,step in enumerate(TEMPLATES[self.anim.currentText()]):
+                self.steps.addItem(f'{i+1}. {step}')
+        finally:
+            self.steps.blockSignals(False)
+        animation = self.anim.currentText()
+        poses = self.model.animations.get(animation, [])
+        if poses:
+            index = min(max(0, self._project_timeline_index.get(project_id, 0)), len(poses)-1)
+            self.frame = index
+            self.model.apply_pose(poses[index])
+            self._pose_draft_key = (project_id, animation, index)
+        else:
+            self.frame = 0
+            self._pose_draft_key = None
+            for part in self.model.parts:
+                if part.get('name') == 'Slimer pose overlay':
+                    part['visible'] = False
+        self._pose_draft_dirty = False
+        self.steps.blockSignals(True)
+        try:
+            self.steps.setCurrentRow(min(self.frame, self.steps.count()-1))
+        finally:
+            self.steps.blockSignals(False)
+        self._reset_slimer_for_project_change()
         self.refresh_timeline();self.refresh()
 
     def add_project(self,model,label,path=None):

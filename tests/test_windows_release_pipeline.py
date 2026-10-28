@@ -65,3 +65,22 @@ class WindowsReleasePipelineTests(unittest.TestCase):
         workflow = (ROOT / '.github/workflows/build-friendly-animator.yml').read_text()
         self.assertIn('Record Windows display and Qt runtime diagnostics', workflow)
         self.assertIn('PySide6.__version__', workflow)
+
+class WindowsBuildTimeoutTests(unittest.TestCase):
+    def test_windows_build_and_gui_checks_have_time_limits(self):
+        workflow = (ROOT / '.github/workflows/build-friendly-animator.yml').read_text()
+        self.assertIn('runs-on: windows-latest\n    timeout-minutes: 45', workflow)
+        for name, limit in (
+            ('Test packaged GUI and offline resources on Windows', 5),
+            ('Test silent install, installed GUI and uninstall on Windows', 10),
+            ('Test reinstall/upgrade and preservation of user projects', 12),
+        ):
+            self.assertIn(f'- name: {name}\n        timeout-minutes: {limit}', workflow)
+
+class WindowsPytestGateTests(unittest.TestCase):
+    def test_windows_ci_runs_pytest_before_packaging(self):
+        workflow = (ROOT / '.github/workflows/build-friendly-animator.yml').read_text()
+        self.assertIn('python -m pytest -q tests', workflow)
+        self.assertIn('Pytest integration regression suite failed', workflow)
+        self.assertIn('FriendlyAnimator-Phase1-Windows-Pytest-Log', workflow)
+        self.assertLess(workflow.index('python -m pytest -q tests'), workflow.index('pyinstaller --noconfirm'))
