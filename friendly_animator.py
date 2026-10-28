@@ -220,6 +220,11 @@ class Suite(QMainWindow):
         QShortcut(QKeySequence('Ctrl+Z'),self,activated=self.undo)
         QShortcut(QKeySequence('Ctrl+Shift+Z'),self,activated=self.redo)
         QShortcut(QKeySequence('Ctrl+Y'),self,activated=self.redo)
+        # Slimer highlight brush size: + / = grows, - shrinks.
+        # Keep these shortcuts scoped to Slimer, never alter another tool.
+        for key in ('+', '='):
+            QShortcut(QKeySequence(key),self,activated=lambda: self.adjust_slimer_brush_size(1))
+        QShortcut(QKeySequence('-'),self,activated=lambda: self.adjust_slimer_brush_size(-1))
         self.onion=QCheckBox('Ghost nearby poses');self.onion.setChecked(False);self.onion.setToolTip('Show faint neighboring poses to help you judge movement. Guides are never exported.');# Ghost controls are now located at the top of the left tool panel.
         self.onion_next=QCheckBox('Also show next');self.onion_next.setToolTip('Show the following pose as another faint guide.');self.onion_next.toggled.connect(self.refresh)
         self.onion.stateChanged.connect(self.refresh)
@@ -280,12 +285,12 @@ class Suite(QMainWindow):
         ll.addWidget(QLabel('SLIME CLEANER • erase pixels to transparency'))
         self.cleaner_toggle=QPushButton('Activate Slime Cleaner')
         self.cleaner_toggle.setCheckable(True)
-        self.cleaner_toggle.setToolTip('Independent eraser. Left-drag to clear pixels on the current pose. Undo restores a stroke. Slimer never automatically erases originals.')
+        self.cleaner_toggle.setToolTip('Independent eraser. Left-drag to clear pixels on the current pose. Undo restores a stroke.')
         self.cleaner_toggle.toggled.connect(self.cleaner_toggle_mode)
         ll.addWidget(self.cleaner_toggle)
         self.cleaner_brush=QSpinBox();self.cleaner_brush.setRange(1,32);self.cleaner_brush.setValue(1)
         form.addRow('Cleaner brush size',self.cleaner_brush)
-        self.slimer_brush=QSpinBox();self.slimer_brush.setRange(1,32);self.slimer_brush.setValue(1);form.addRow('Slimer brush size',self.slimer_brush)
+        self.slimer_brush=QSpinBox();self.slimer_brush.setRange(1,32);self.slimer_brush.setValue(1);self.slimer_brush.setToolTip('While Slimer is active, press + or = to increase highlight size and - to decrease it.');form.addRow('Slimer brush size (+ / -)',self.slimer_brush)
         self.slimer_dx=QSpinBox();self.slimer_dy=QSpinBox();self.slimer_turn=QSpinBox();self.slimer_scale=QSpinBox()
         for spin in (self.slimer_dx,self.slimer_dy):spin.setRange(-2048,2048)
         self.slimer_turn.setRange(-360,360);self.slimer_scale.setRange(10,800);self.slimer_scale.setValue(100)
@@ -293,6 +298,17 @@ class Suite(QMainWindow):
         for spin in (self.slimer_dx,self.slimer_dy,self.slimer_turn,self.slimer_scale):
             spin.valueChanged.connect(lambda value, control=spin: self.slimer_numeric_changed(control, value))
             spin.setToolTip('Slimer numeric adjustment. Slimer Undo reverses this change without changing placed artwork.')
+        self.slimer_move_original=QCheckBox('Move Original Pixels (uncheck to Copy Pixels)')
+        self.slimer_move_original.setChecked(True)
+        self.slimer_move_original.setToolTip('Checked: clear selected pixels from the active pose when placing. Unchecked: copy them and keep the originals. Existing saved poses stay unchanged.')
+        ll.addWidget(self.slimer_move_original)
+        ll.addWidget(QLabel('SLIMER PREVIEW • selected pixels only'))
+        self.slimer_preview_label=QLabel('Highlight pixels to preview')
+        self.slimer_preview_label.setMinimumHeight(142)
+        self.slimer_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.slimer_preview_label.setStyleSheet('background: #202833; border: 1px solid #64748b;')
+        self.slimer_preview_label.setToolTip('Preview of selected pixels and their current move, rotation, and scale. Not exported.')
+        ll.addWidget(self.slimer_preview_label)
         slimer_actions=QHBoxLayout();ll.addLayout(slimer_actions)
         for label,callback in [('Place as Layer',self.slimer_place_layer),('Place Frame',self.slimer_place_frame),('Clear Selection',self.slimer_clear)]:
             button=QPushButton(label);button.clicked.connect(callback);slimer_actions.addWidget(button)
@@ -306,13 +322,15 @@ class Suite(QMainWindow):
         self.slimer_phase_picker.currentTextChanged.connect(self.slimer_switch_phase)
         form.addRow('Highlight phase',self.slimer_phase_picker)
         phase_buttons=QHBoxLayout();ll.addLayout(phase_buttons)
-        color_button=QPushButton('Change highlight color')
+        self.slimer_color_button=QPushButton('Change highlight color')
+        color_button=self.slimer_color_button
         color_button.clicked.connect(self.slimer_choose_color)
         phase_buttons.addWidget(color_button)
         add_phase=QPushButton('+ New phase')
         add_phase.clicked.connect(self.slimer_add_phase)
         phase_buttons.addWidget(add_phase)
         self.slimer_selection=None
+        self._update_slimer_color_button()
 
         splitter.addWidget(self.scroll_panel(left))
         middle=QWidget();ml=QVBoxLayout(middle);ml.setContentsMargins(5,2,5,3);ml.setSpacing(3)
@@ -807,13 +825,20 @@ class Suite(QMainWindow):
         self._slimer_current_phase=name
         self.slimer_selection.mask=self.slimer_phase_masks.get(name,Image.new('L',self.model.size,0)).copy()
         self.slimer_selection_undo.clear();self.slimer_selection_redo.clear()
+        self._update_slimer_color_button()
         self.refresh()
+
+    def _update_slimer_color_button(self):
+        color=self.slimer_phase_colors.get(self.slimer_phase_picker.currentText(),'#54e88a')
+        self.slimer_color_button.setStyleSheet(f'QPushButton {{ border: 2px solid {color}; }}')
+        self.slimer_color_button.setToolTip(f'Current Slimer highlight color: {color}. Selection tint is editor-only.')
 
     def slimer_choose_color(self):
         name=self.slimer_phase_picker.currentText()
         color=QColorDialog.getColor(QColor(self.slimer_phase_colors[name]),self,'Slimer highlight color')
         if color.isValid():
             self.slimer_phase_colors[name]=color.name()
+            self._update_slimer_color_button()
             self.refresh()
 
     def slimer_add_phase(self):
@@ -837,8 +862,22 @@ class Suite(QMainWindow):
 
     def cleaner_paint(self,x,y):
         from studio.slime_cleaner import erase_visible_pixels
-        erase_visible_pixels(self.model.parts,x,y,self.cleaner_brush.value())
+        if erase_visible_pixels(self.model.parts,x,y,self.cleaner_brush.value()):
+            # The renderer and pose snapshots use originals, not only part images.
+            # Keep both representations synchronized so erased pixels stay erased.
+            for index, part in enumerate(self.model.parts):
+                if index < len(self.model.originals):
+                    self.model.originals[index] = part['image'].copy()
         self.refresh()
+
+    def adjust_slimer_brush_size(self,delta):
+        """Change highlight size from the keyboard only when Slimer is active."""
+        if not self.slimer_toggle.isChecked():
+            return
+        current=self.slimer_brush.value()
+        target=max(self.slimer_brush.minimum(),min(self.slimer_brush.maximum(),current+delta))
+        self.slimer_brush.setValue(target)
+        self.status.setText(f'Slimer highlight brush size: {target} px (+ / -)')
 
     def slimer_toggle_mode(self,enabled):
         if enabled and self.cleaner_toggle.isChecked():
@@ -993,6 +1032,10 @@ class Suite(QMainWindow):
             self.preserve_pose_draft()
         self.remember()  # A complete placement, including new layer/frame, is ONE undo step.
         result=self.slimer_preview()  # Selected pixels only, not the full creature.
+        if self.slimer_move_original.isChecked():
+            # Clear only the active working pose; the previous timeline pose was
+            # snapshotted above before this destructive part of the operation.
+            self._slimer_erase_original_layers(selection.mask)
         if as_frame:
             # Reuse the dedicated Slimer overlay layer instead of appending a
             # second/third/etc. "Slimer pose" asset on every Place Frame click.
@@ -1044,7 +1087,7 @@ class Suite(QMainWindow):
             self.select_timeline_pose(index)
         self.sync_slimer_asset_labels()
         self.slimer_clear()
-        self.status.setText('Slimer placement complete. Original pixels were preserved; use Slime Cleaner to erase deliberately.')
+        self.status.setText('Slimer placement complete: originals moved.' if self.slimer_move_original.isChecked() else 'Slimer placement complete: originals copied.')
         self.refresh()
 
     def slimer_place_layer(self):self._slimer_commit(False)
@@ -1724,12 +1767,21 @@ class Suite(QMainWindow):
                 self.canvas.slimer_bounds=(x0+self.slimer_dx.value(),y0+self.slimer_dy.value(),x1+self.slimer_dx.value(),y1+self.slimer_dy.value())
             composed.alpha_composite(preview)
             marker=Image.new('RGBA',composed.size)
-            marker.putalpha(self.slimer_selection.mask.point(lambda v: 26 if v else 0))
+            # A 10% tint (alpha 26) was nearly invisible on detailed pixel art.
+            # Keep the selected color clearly visible without changing source pixels.
+            marker.putalpha(self.slimer_selection.mask.point(lambda v: 120 if v else 0))
             chosen=QColor(self.slimer_phase_colors.get(self.slimer_phase_picker.currentText(),'#54e88a'))
             tint=Image.new('RGBA',composed.size,(chosen.red(),chosen.green(),chosen.blue(),0));tint.putalpha(marker.getchannel('A'))
             if not self.canvas.slimer_transform_mode:composed.alpha_composite(tint)
             data=composed.tobytes('raw','RGBA');image=QImage(data,composed.width,composed.height,composed.width*4,QImage.Format.Format_RGBA8888).copy()
         self.canvas.set_art(QPixmap.fromImage(image))
+        if hasattr(self, 'slimer_preview_label'):
+            if self.slimer_toggle.isChecked() and self.slimer_selection is not None and self.slimer_selection.mask.getbbox():
+                self.slimer_preview_label.setPixmap(pixmap(self.slimer_preview(), 132))
+                self.slimer_preview_label.setText('')
+            else:
+                self.slimer_preview_label.clear()
+                self.slimer_preview_label.setText('Highlight pixels to preview')
         self.refresh_preview()
         recipe=TEMPLATES[self.anim.currentText()];step=recipe[self.frame % len(recipe)]
         self.pose_tip.setVisible(self.buddy_toggle.isChecked())
