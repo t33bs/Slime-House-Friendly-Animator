@@ -69,7 +69,9 @@ def cleanup_asset_versions(project_path, *, confirmed=False, backup_roots=(),
                 return []
     # Recheck the active manifest immediately before deleting anything.
     fresh = inspect_asset_versions(project)
-    if fresh['active'] != result['active']:
+    # Windows may expand an 8.3 short parent path (RUNNER~1) when
+    # resolving the project. Compare canonical paths, not spellings.
+    if fresh['active'].resolve() != result['active'].resolve():
         return []
     removed = []
     for folder in fresh['orphans']:

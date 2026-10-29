@@ -27,6 +27,37 @@ class AssetVersionsTests(unittest.TestCase):
             self.assertTrue(active.exists())
             self.assertTrue(other.exists())
 
+    def test_cleanup_allows_equivalent_active_path_spellings(self):
+        # Windows can resolve a short 8.3 directory name to a long name
+        # between the first inspection and the safety recheck.
+        from unittest.mock import patch
+        from studio import asset_versions
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = root / 'cat.json'
+            active = root / ('cat_assets_' + 'a' * 32)
+            old = root / ('cat_assets_' + 'b' * 32)
+            active.mkdir(); old.mkdir()
+            project.write_text(json.dumps({'asset_dir': active.name}))
+            real_inspect = asset_versions.inspect_asset_versions
+            calls = [0]
+
+            def alternate_spelling(path):
+                result = real_inspect(path)
+                calls[0] += 1
+                if calls[0] == 1:
+                    # The same directory via an equivalent but different
+                    # lexical spelling (the cross-platform form of the bug).
+                    result['active'] = root / 'alias' / '..' / active.name
+                return result
+
+            with patch.object(asset_versions, 'inspect_asset_versions', alternate_spelling):
+                removed = asset_versions.cleanup_asset_versions(
+                    project, confirmed=True, backup_inventory_complete=True)
+            self.assertEqual(removed, [old])
+            self.assertFalse(old.exists())
+            self.assertTrue(active.exists())
+
     def test_legacy_manifest_disables_cleanup(self):
         with tempfile.TemporaryDirectory() as temp:
             project = Path(temp) / 'cat.json'
