@@ -29,4 +29,7 @@ def test_confirm_all_combines_two_tabs_as_one_layer():
     assert image.getpixel((5, 5)) == (255, 0, 0, 255)
     assert image.getpixel((12, 10)) == (0, 0, 255, 255)
     assert window.model.parts[0]['image'].getpixel((10, 10)) == (0, 0, 255, 255)
+    # Test cleanup must not open an interactive unsaved-project dialog.
+    # Production close/save behavior remains unchanged.
+    window.confirm_unsaved_projects = lambda: True
     window.close()
