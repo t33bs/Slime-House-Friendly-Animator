@@ -37,7 +37,7 @@ class ExportRegressions(unittest.TestCase):
         model.animations['idle'] = poses
         with tempfile.TemporaryDirectory() as folder:
             apng = model.export_animations(folder, gif=False)
-            self.assertEqual([p.suffix for p in apng], ['.png'])
+            self.assertEqual([p.suffix for p in apng], ['.apng'])
             gif = model.export_animations(folder, apng=False)
             self.assertEqual([p.suffix for p in gif], ['.gif'])
             for path in apng + gif:

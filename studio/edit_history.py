@@ -7,7 +7,8 @@ def capture(model):
     return deepcopy({
         'size': model.size, 'parts': model.parts, 'originals': model.originals,
         'animations': model.animations, 'current': model.current,
-        'frame_durations': model.frame_durations, 'anchors': model.anchors,
+        'frame_durations': model.frame_durations, 'pose_ids': model.pose_ids,
+        'pose_recovery': model.pose_recovery, 'anchors': model.anchors,
         'angles': model.angles, 'attachments': model.attachments,
     })
 

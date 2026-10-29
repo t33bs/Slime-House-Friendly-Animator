@@ -19,9 +19,11 @@ from studio.pet_suite_model import PetSuiteModel
 from studio.edit_history import EditHistory
 from studio.slimer_tool import SlimerSelection
 from studio.pet_suite_templates import TEMPLATES
-from studio.reference_animation import reference_frame
 from studio.comparison_sync import comparison_position
-from studio.slime_buddy import STATIONS, station_guide, motion_tip
+from studio.playback_clock import PlaybackClock
+from studio.playback_resume import resume_position
+from studio.timeline_retime import retime_elapsed
+from studio.slime_buddy import STATIONS, station_guide
 from studio.technical_checks import check_animation
 from studio.workspace_identity import animation_key
 from studio.recovery import (recovery_path, read_recovery, discard_recovery,
@@ -31,6 +33,39 @@ def pixmap(img,size=260):
     rgba=img.convert('RGBA');data=rgba.tobytes('raw','RGBA')
     q=QImage(data,rgba.width,rgba.height,rgba.width*4,QImage.Format.Format_RGBA8888).copy()
     return QPixmap.fromImage(q).scaled(size,size,Qt.AspectRatioMode.KeepAspectRatio,Qt.TransformationMode.FastTransformation)
+
+class SlimerColorTabs(QTabBar):
+    """Named selection tabs with the small compatibility API of the old picker."""
+    currentTextChanged = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setExpanding(False)
+        self.setUsesScrollButtons(True)
+        self.currentChanged.connect(self._emit_current_text)
+
+    def _emit_current_text(self, index):
+        if index >= 0:
+            self.currentTextChanged.emit(self.tabText(index))
+
+    def addItem(self, name):
+        return self.addTab(name)
+
+    def addItems(self, names):
+        for name in names:
+            self.addItem(name)
+
+    def currentText(self):
+        index = self.currentIndex()
+        return self.tabText(index) if index >= 0 else ''
+
+    def setCurrentText(self, name):
+        for index in range(self.count()):
+            if self.tabText(index) == name:
+                self.setCurrentIndex(index)
+                return
+        raise ValueError(f'Unknown Slimer selection tab: {name}')
+
 
 class DragCanvas(QLabel):
     """Pixel-space hit testing with movable parts and bottom-right resize handles."""
@@ -207,7 +242,7 @@ class Suite(QMainWindow):
         base=QWidget();self.setCentralWidget(base);outer=QVBoxLayout(base)
         top_container=QWidget();top=QHBoxLayout(top_container);top.setContentsMargins(0,0,0,0)
         top_scroll=QScrollArea();top_scroll.setWidget(top_container);top_scroll.setWidgetResizable(True);top_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded);top_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff);top_scroll.setFixedHeight(42);outer.addWidget(top_scroll)
-        for title,callback in [('Import PNG assets',self.import_assets),('Open creature',self.open_project),('New creature',self.new_project),('Save creature',self.save_project),('Export Sprite Sheet',self.export),('Export GIF / APNG',self.export_animated),('Export Frame PNG',self.export_current_frame),('Edit Frame in SHS',self.edit_frame_in_shs),('Set SHS Location',self.choose_shs_location),('Reload SHS Edit',self.reload_shs_edit),('Replace Frame PNG',self.replace_current_frame_png)]:
+        for title,callback in [('Import PNG assets',self.import_assets),('Open creature',self.open_project),('New creature',self.new_project),('Save creature',self.save_project),('Export Sprite Sheet',self.export),('Export GIF / APNG',self.export_animated),('Export Frame PNG',self.export_current_frame),('Export All Frames',self.export_all_frames),('Edit Frame in SHS',self.edit_frame_in_shs),('Set SHS Location',self.choose_shs_location),('Reload SHS Edit',self.reload_shs_edit),('Replace Frame PNG',self.replace_current_frame_png)]:
             b=QPushButton(title);b.clicked.connect(callback);top.addWidget(b)
         update_button=QPushButton('Check for updates');update_button.clicked.connect(self.check_for_updates);top.addWidget(update_button)
         self.status=QLabel('Welcome! Import PNG parts, pick an animation, and create your first pose.');outer.addWidget(self.status)
@@ -220,11 +255,12 @@ class Suite(QMainWindow):
         QShortcut(QKeySequence('Ctrl+Z'),self,activated=self.undo)
         QShortcut(QKeySequence('Ctrl+Shift+Z'),self,activated=self.redo)
         QShortcut(QKeySequence('Ctrl+Y'),self,activated=self.redo)
-        # Slimer highlight brush size: + / = grows, - shrinks.
-        # Keep these shortcuts scoped to Slimer, never alter another tool.
-        for key in ('+', '='):
-            QShortcut(QKeySequence(key),self,activated=lambda: self.adjust_slimer_brush_size(1))
-        QShortcut(QKeySequence('-'),self,activated=lambda: self.adjust_slimer_brush_size(-1))
+        # App-wide brush sizing follows whichever painting tool is active.
+        # ApplicationShortcut also works while focus is in the canvas or side panels.
+        for key, delta in (('+', 1), ('=', 1), ('-', -1)):
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+            shortcut.activated.connect(lambda step=delta: self.adjust_active_brush_size(step))
         self.onion=QCheckBox('Ghost nearby poses');self.onion.setChecked(False);self.onion.setToolTip('Show faint neighboring poses to help you judge movement. Guides are never exported.');# Ghost controls are now located at the top of the left tool panel.
         self.onion_next=QCheckBox('Also show next');self.onion_next.setToolTip('Show the following pose as another faint guide.');self.onion_next.toggled.connect(self.refresh)
         self.onion.stateChanged.connect(self.refresh)
@@ -237,7 +273,9 @@ class Suite(QMainWindow):
         order=QHBoxLayout();ll.addLayout(order)
         for label,offset in [('Move layer up',1),('Move layer down',-1)]:
             b=QPushButton(label);b.clicked.connect(lambda checked=False,d=offset:self.move_layer(d));order.addWidget(b)
-        ll.addWidget(QLabel('Selected asset • editable sizing and placement'))
+        self.active_asset_label=QLabel('Editing: No asset selected')
+        self.active_asset_label.setToolTip('Choose a row in the Asset Library above. Only that asset receives sizing and placement edits.')
+        ll.addWidget(self.active_asset_label)
         form=QFormLayout();ll.addLayout(form)
         self.x=QSpinBox();self.y=QSpinBox();self.w=QSpinBox();self.h=QSpinBox()
         for spin in (self.x,self.y,self.w,self.h):spin.setRange(-2048 if spin in (self.x,self.y) else 1,2048);spin.valueChanged.connect(self.update_asset)
@@ -271,12 +309,12 @@ class Suite(QMainWindow):
         self.slimer_toggle=QPushButton('Activate Slimer Tool');self.slimer_toggle.setCheckable(True);self.slimer_toggle.toggled.connect(self.slimer_toggle_mode);ll.addWidget(self.slimer_toggle)
         self.slimer_drag_toggle=QPushButton('Drag selected pixels (Shift=resize, Alt=rotate)')
         self.slimer_drag_toggle.setCheckable(True)
-        self.slimer_drag_toggle.setToolTip('Use the green square to resize and the blue circle to rotate. Slimer Tool: First highlight pixels in Paint Selection mode. Then click here and drag the highlighted area to move it. Hold Shift while dragging to resize; hold Alt while dragging to rotate. For exact adjustments, use the Slime move X/Y, rotate, and size controls. Click Place Frame or Place as Layer when ready.')
+        self.slimer_drag_toggle.setToolTip('First highlight pixels, then click Finish Selecting. Drag the outlined selection to move it; Shift-drag resizes and Alt-drag rotates. Click Edit Selection to paint more highlights.')
         self.slimer_drag_toggle.toggled.connect(self.slimer_drag_mode)
         ll.addWidget(self.slimer_drag_toggle)
         self.slimer_finish=QPushButton('✓ Finish Selecting → Move')
         self.slimer_finish.setToolTip('Finish highlighting. Hide the colored paint and move the selected pixels with a clear outline. Use Edit Selection to adjust the mask.')
-        self.slimer_finish.clicked.connect(lambda:self.slimer_drag_toggle.setChecked(True))
+        self.slimer_finish.clicked.connect(self.slimer_finish_selecting)
         ll.addWidget(self.slimer_finish)
         self.slimer_selection_undo=[];self.slimer_selection_redo=[];self._slimer_numeric_replaying=False
         selection_actions=QHBoxLayout();ll.addLayout(selection_actions)
@@ -289,7 +327,7 @@ class Suite(QMainWindow):
         self.cleaner_toggle.toggled.connect(self.cleaner_toggle_mode)
         ll.addWidget(self.cleaner_toggle)
         self.cleaner_brush=QSpinBox();self.cleaner_brush.setRange(1,32);self.cleaner_brush.setValue(1)
-        form.addRow('Cleaner brush size',self.cleaner_brush)
+        self.cleaner_brush.setToolTip('While Slime Cleaner is active, press + or = to increase size and - to decrease it.');form.addRow('Cleaner brush size (+ / -)',self.cleaner_brush)
         self.slimer_brush=QSpinBox();self.slimer_brush.setRange(1,32);self.slimer_brush.setValue(1);self.slimer_brush.setToolTip('While Slimer is active, press + or = to increase highlight size and - to decrease it.');form.addRow('Slimer brush size (+ / -)',self.slimer_brush)
         self.slimer_dx=QSpinBox();self.slimer_dy=QSpinBox();self.slimer_turn=QSpinBox();self.slimer_scale=QSpinBox()
         for spin in (self.slimer_dx,self.slimer_dy):spin.setRange(-2048,2048)
@@ -302,25 +340,29 @@ class Suite(QMainWindow):
         self.slimer_move_original.setChecked(True)
         self.slimer_move_original.setToolTip('Checked: clear selected pixels from the active pose when placing. Unchecked: copy them and keep the originals. Existing saved poses stay unchanged.')
         ll.addWidget(self.slimer_move_original)
-        ll.addWidget(QLabel('SLIMER PREVIEW • selected pixels only'))
-        self.slimer_preview_label=QLabel('Highlight pixels to preview')
+        self.slimer_preview_label=QLabel('Finish Selecting to show preview')
         self.slimer_preview_label.setMinimumHeight(142)
         self.slimer_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.slimer_preview_label.setStyleSheet('background: #202833; border: 1px solid #64748b;')
         self.slimer_preview_label.setToolTip('Preview of selected pixels and their current move, rotation, and scale. Not exported.')
-        ll.addWidget(self.slimer_preview_label)
         slimer_actions=QHBoxLayout();ll.addLayout(slimer_actions)
         for label,callback in [('Place as Layer',self.slimer_place_layer),('Place Frame',self.slimer_place_frame),('Clear Selection',self.slimer_clear)]:
             button=QPushButton(label);button.clicked.connect(callback);slimer_actions.addWidget(button)
+        self.slimer_confirm_all=QPushButton('✓ Confirm All Placements')
+        self.slimer_confirm_all.setToolTip('Place all color-tab selections together as one undoable layer. Each tab keeps its own movement, rotation and size. For one tab, use Place as Layer or Place Frame.')
+        self.slimer_confirm_all.clicked.connect(self.slimer_confirm_all_placements)
+        ll.addWidget(self.slimer_confirm_all)
         # Independent, color-coded selection masks for animation phases.
         # The color is a canvas overlay only; exports never include it.
         self.slimer_phase_colors={'Start':'#54e88a','Middle':'#58b9ff','End':'#d38bff'}
         self.slimer_phase_masks={}
-        self.slimer_phase_picker=QComboBox()
+        self.slimer_phase_transforms={}  # Each highlight phase owns its own move/rotate/scale.
+        self.slimer_phase_histories={}  # Undo/Redo stays with its color tab.
+        self.slimer_phase_picker=SlimerColorTabs()
         self.slimer_phase_picker.addItems(self.slimer_phase_colors)
-        self.slimer_phase_picker.setToolTip('Choose which animation phase to highlight. Each phase remembers its own pixel selection; colors are guides only.')
+        self.slimer_phase_picker.setToolTip('Click a color tab to edit its independent pixel selection and transform. Tabs scroll when many colors are used.')
         self.slimer_phase_picker.currentTextChanged.connect(self.slimer_switch_phase)
-        form.addRow('Highlight phase',self.slimer_phase_picker)
+        form.addRow('Selection color tabs',self.slimer_phase_picker)
         phase_buttons=QHBoxLayout();ll.addLayout(phase_buttons)
         self.slimer_color_button=QPushButton('Change highlight color')
         color_button=self.slimer_color_button
@@ -354,7 +396,7 @@ class Suite(QMainWindow):
         self.buddy_station=QComboBox();self.buddy_station.addItems(STATIONS);self.buddy_station.setToolTip('Choose the station you want help with. This never edits your art.');buddy_row.addWidget(self.buddy_station)
         self.buddy_details=QLabel();self.buddy_details.setWordWrap(True);self.buddy_details.setStyleSheet('color:#c7e9c6;padding:4px');ml.addWidget(self.buddy_details)
         self.pose_tip=QLabel();self.pose_tip.setWordWrap(True);self.pose_tip.setStyleSheet('color:#bce6b9;padding:3px');ml.addWidget(self.pose_tip)
-        self.slimer_buddy_tip=QLabel('🟢 Slime Buddy • Choose a Highlight Phase (Start, Middle, End, or your own) and a color to organize selections. Highlights are guides only and never export. Slimer Tool: Use the green square to resize or the blue circle to rotate your selection. Paint over the pixels you want to adjust, then select Drag Selected Pixels. Drag to move, hold Shift + drag to resize, or Alt + drag to rotate. Need precision? Use the Slime move, rotate, and size number boxes. Finish with Place Frame or Place as Layer.')
+        self.slimer_buddy_tip=QLabel('🟢 Slime Buddy • Pick a color tab and highlight pixels. Click Finish Selecting to move the outlined selection; use Edit Selection to highlight more. Place as Layer or Place Frame for one selection, or Confirm All Placements for multiple tabs. Highlights are never exported.')
         self.slimer_buddy_tip.setWordWrap(True)
         self.slimer_buddy_tip.setStyleSheet('color:#c7e9c6;background:#30483b;border:1px solid #64866b;border-radius:6px;padding:8px')
         self.slimer_buddy_tip.setToolTip('This tip is optional and appears only while Slime Buddy and Slimer Tool are enabled.')
@@ -395,7 +437,7 @@ class Suite(QMainWindow):
         for label,callback in [('Save Current Pose',self.save_frame),('Restore Previous Pose',self.restore_previous_timeline_pose),('Duplicate last frame',self.duplicate_frame),('Previous frame',self.prev_frame),('Next frame',self.next_frame)]:
             b=QPushButton(label);b.clicked.connect(callback);actions.addWidget(b)
         timeline_tools=QHBoxLayout();ml.addLayout(timeline_tools)
-        for label,callback in [('➕ Add pose',self.insert_pose),('📋 Copy pose',self.copy_pose),('🗑 Remove pose',self.remove_pose),('← Shift pose',lambda:self.shift_pose(-1)),('Shift pose →',lambda:self.shift_pose(1))]:
+        for label,callback in [('➕ Add pose',self.insert_pose),('📥 Import Pose PNG',self.import_pose_png),('📋 Copy pose',self.copy_pose),('🗑 Remove pose',self.remove_pose),('← Shift pose',lambda:self.shift_pose(-1)),('Shift pose →',lambda:self.shift_pose(1))]:
             button=QPushButton(label);button.setToolTip('Edit the saved poses in this animation. You can undo this change.');button.clicked.connect(callback);timeline_tools.addWidget(button)
         splitter.addWidget(self.scroll_panel(middle))
         right=QWidget();rl=QVBoxLayout(right);rl.addWidget(QLabel('STEP 3 • COMPARE & PREVIEW'))
@@ -413,16 +455,10 @@ class Suite(QMainWindow):
         buddy_line.addWidget(self.buddy_dock_toggle)
         rl.addWidget(self.slimer_buddy_tip)
 
-        self.reference_toggle=QCheckBox('Show optional 2D pixel animation reference')
-        self.reference_toggle.setChecked(self.settings.value('show_pixel_reference',False,type=bool))
-        self.reference_toggle.setToolTip('Optional frame-by-frame movement inspiration; not an anatomy rule. Hide it to maximize your sprite preview.')
-        rl.addWidget(self.reference_toggle)
-        self.reference_toggle.toggled.connect(lambda checked:self.settings.setValue('show_pixel_reference',checked))
-        self.reference_body=QComboBox();self.reference_body.addItems(['Biped','Quadruped','Floating']);self.reference_body.setToolTip('Pick a simple reference shape. This does not change your creature.');self.reference_body.currentIndexChanged.connect(self.refresh_preview);self.reference_body.currentIndexChanged.connect(self.refresh);rl.addWidget(self.reference_body)
-        self.desired=QLabel();self.desired.setAlignment(Qt.AlignmentFlag.AlignCenter);self.desired.setMinimumHeight(135);self.desired.setStyleSheet('background:#303e3c');rl.addWidget(self.desired)
-        self.desired_label=QLabel('Reference step');self.desired_label.setWordWrap(True);rl.addWidget(self.desired_label)
-        self.reference_toggle.toggled.connect(lambda checked:(self.reference_body.setVisible(checked),self.desired.setVisible(checked),self.desired_label.setVisible(checked)))
-        for widget in (self.reference_body,self.desired,self.desired_label):widget.setVisible(self.reference_toggle.isChecked())
+        # Preset 2D reference drawings and shape selector were intentionally removed.
+        # User-uploaded references below remain available as an optional tool.
+        rl.addWidget(QLabel('SLIMER PREVIEW • selected pixels only'))
+        rl.addWidget(self.slimer_preview_label)
         # User-provided animation reference: separate from editing and never included in exports.
         self.reference_files=[]
         self.reference_index=0
@@ -489,6 +525,7 @@ class Suite(QMainWindow):
         if self.settings.value('comparison_hidden',False,type=bool):
             self.comparison_panel.hide();self.comparison_toggle.setText('👁 Show comparison')
         self.elapsed_ms=0
+        self.playback_clock=PlaybackClock()
         self.timer=QTimer(self);self.timer.timeout.connect(self.tick);self.timer.start(25)
         self.recovery_timer=QTimer(self);self.recovery_timer.timeout.connect(self.autosave_recovery);self.recovery_timer.start(60000)
         self.change_anim(self.anim.currentText());self.toggle_mode(initial=True);self.add_workspace_tab("project",f"0::{self._project_name}");self.add_workspace_tab("animation",self.anim.currentText());self.add_workspace_tab("phase","Timeline");self.add_workspace_tab("phase","Rigging");self.select_workspace_key(("animation",self.anim.currentText()))
@@ -822,9 +859,33 @@ class Suite(QMainWindow):
         previous=getattr(self,'_slimer_current_phase',None)
         if previous:
             self.slimer_phase_masks[previous]=self.slimer_selection.mask.copy()
+            self.slimer_phase_transforms[previous]=(self.slimer_dx.value(), self.slimer_dy.value(), self.slimer_turn.value(), self.slimer_scale.value())
+            self.slimer_phase_histories[previous]=(self.slimer_selection_undo, self.slimer_selection_redo)
         self._slimer_current_phase=name
+        # Transform handles belong to the previous color tab. Keep tab masks
+        # and numeric values, but do not carry an active drag into another tab.
+        if hasattr(self, 'canvas'):
+            self.canvas.slimer_transform_mode=False
+            self.canvas.slimer_bounds=None
+            self.canvas._slimer_handle=None
+            self.canvas._slimer_painting=False
+            self.canvas._slimer_last=None
+        self._slimer_mouse_transforming=False
+        if hasattr(self, 'slimer_drag_toggle'):
+            self.slimer_drag_toggle.blockSignals(True)
+            try:
+                self.slimer_drag_toggle.setChecked(False)
+            finally:
+                self.slimer_drag_toggle.blockSignals(False)
+            self.slimer_drag_toggle.setText('Drag selected pixels (Shift=resize, Alt=rotate)')
         self.slimer_selection.mask=self.slimer_phase_masks.get(name,Image.new('L',self.model.size,0)).copy()
-        self.slimer_selection_undo.clear();self.slimer_selection_redo.clear()
+        values=self.slimer_phase_transforms.get(name,(0,0,0,100))
+        for spin,value in zip((self.slimer_dx,self.slimer_dy,self.slimer_turn,self.slimer_scale),values):
+            spin.blockSignals(True)
+            spin.setValue(value)
+            spin.blockSignals(False)
+        self.slimer_selection_undo, self.slimer_selection_redo = self.slimer_phase_histories.get(name, ([], []))
+        self._slimer_sync_numeric_values()
         self._update_slimer_color_button()
         self.refresh()
 
@@ -870,6 +931,20 @@ class Suite(QMainWindow):
                     self.model.originals[index] = part['image'].copy()
         self.refresh()
 
+    def adjust_active_brush_size(self,delta):
+        """Route +/- to the currently active brush without changing the other tool."""
+        if self.cleaner_toggle.isChecked():
+            brush = self.cleaner_brush
+            label = 'Slime Cleaner'
+        elif self.slimer_toggle.isChecked():
+            brush = self.slimer_brush
+            label = 'Slimer highlight'
+        else:
+            return
+        target = max(brush.minimum(), min(brush.maximum(), brush.value() + delta))
+        brush.setValue(target)
+        self.status.setText(f'{label} brush size: {target} px (+ / -)')
+
     def adjust_slimer_brush_size(self,delta):
         """Change highlight size from the keyboard only when Slimer is active."""
         if not self.slimer_toggle.isChecked():
@@ -893,12 +968,30 @@ class Suite(QMainWindow):
         if enabled:
             self.slimer_selection=SlimerSelection.empty(self.model.render())
             self.slimer_phase_masks={}
+            self.slimer_phase_transforms={}
+            self.slimer_phase_histories={}
             self._slimer_current_phase=self.slimer_phase_picker.currentText()
         else:
             self.slimer_selection=None
         self.refresh_buddy()
-        self.status.setText('Slimer: left-drag to highlight, right-drag to erase. Adjust move/rotate/size, then Place Frame or Place as Layer.' if enabled else 'Slimer brush disabled.')
+        self.status.setText('Slimer: left-drag to highlight, right-drag to erase highlights. Click Finish Selecting when ready to move pixels.' if enabled else 'Slimer brush disabled.')
         self.refresh()
+
+    def slimer_finish_selecting(self):
+        """Turn highlighted pixels into a movable, uncommitted Slimer selection.
+
+        The floating selection is deliberately not an Asset Library layer until
+        Place as Layer is pressed; this keeps cancel/edit safe and undoable.
+        """
+        if not self.slimer_toggle.isChecked():
+            self.status.setText('Activate Slimer, then highlight the pixels you want to move.')
+            return
+        if self.slimer_selection is None or self.slimer_selection.mask.getbbox() is None:
+            self.status.setText('No pixels highlighted. Paint a selection before Finish Selecting.')
+            return
+        self.slimer_drag_toggle.setChecked(True)
+        self.refresh()
+        self.status.setText('Selection ready: drag to move, Shift-drag to resize, Alt-drag to rotate. Use Edit Selection to change highlights, or place the result.')
 
     def slimer_drag_mode(self,enabled):
         self.canvas.slimer_transform_mode=enabled
@@ -997,9 +1090,81 @@ class Suite(QMainWindow):
         return self.slimer_selection.transform(self.slimer_dx.value(),self.slimer_dy.value(),
             max(1,round((bounds[2]-bounds[0])*scale)),max(1,round((bounds[3]-bounds[1])*scale)),self.slimer_turn.value())
 
+    def slimer_confirm_all_placements(self):
+        """Place all nonempty color tabs together as one independent layer.
+
+        Preserve each tab's transform and original-pixel mask. A single
+        placement uses one history snapshot, rather than committing tabs in
+        sequence and accidentally resampling already-edited artwork.
+        """
+        from PIL import ImageChops
+        if self.slimer_selection is None:
+            self.status.setText('Activate Slimer and highlight pixels first.')
+            return
+        active = self.slimer_phase_picker.currentText()
+        self.slimer_phase_masks[active] = self.slimer_selection.mask.copy()
+        self.slimer_phase_transforms[active] = (self.slimer_dx.value(), self.slimer_dy.value(),
+                                                self.slimer_turn.value(), self.slimer_scale.value())
+        layers = []
+        union = Image.new('L', self.model.size, 0)
+        # Use the current unmodified source for every phase, not the result
+        # of an earlier phase's placement.
+        source = self.model.render().copy()
+        for name in self.slimer_phase_colors:
+            mask = self.slimer_phase_masks.get(name)
+            if mask is None or mask.getbbox() is None:
+                continue
+            dx, dy, turn, scale = self.slimer_phase_transforms.get(name, (0, 0, 0, 100))
+            selection = SlimerSelection(source.copy(), mask.copy())
+            bounds = mask.getbbox()
+            transformed = selection.transform(dx, dy,
+                max(1, round((bounds[2]-bounds[0]) * scale / 100)),
+                max(1, round((bounds[3]-bounds[1]) * scale / 100)), turn)
+            layers.append(transformed)
+            union = ImageChops.lighter(union, mask)
+        if not layers:
+            self.status.setText('Highlight pixels in at least one color tab first.')
+            return
+        if self.slimer_move_original.isChecked() and not self._slimer_original_erase_safe(union):
+            self.status.setText('Move Original is unavailable for rotated or resized layers. Use Copy Pixels instead.')
+            return
+        self.remember()
+        if self.slimer_move_original.isChecked():
+            self._slimer_erase_original_layers(union)
+        combined = Image.new('RGBA', self.model.size)
+        for layer in layers:
+            # Binary masks retain exact pixel RGBA, including partial alpha.
+            opaque = layer.getchannel('A').point(lambda a: 255 if a else 0)
+            combined.paste(layer, (0, 0), opaque)
+        existing = {part.get('name', '') for part in self.model.parts}
+        number = 1
+        while f'Slimer Layer {number:03d}' in existing:
+            number += 1
+        self.model.import_part(f'Slimer Layer {number:03d}', combined)
+        self.assets.addItem(self.model.parts[-1]['name'])
+        self.assets.setCurrentRow(len(self.model.parts)-1)
+        self.sync_slimer_asset_labels()
+        self.slimer_clear()
+        self.status.setText(f'Confirmed {len(layers)} color selections as one layer. Undo reverses the whole placement.')
+        self.refresh()
+
     def slimer_clear(self):
+        # Clearing a finished selection must also discard its floating handles.
+        # Otherwise a later highlight can inherit stale transform-mode UI.
+        self.canvas.slimer_transform_mode = False
+        self.canvas.slimer_bounds = None
+        self.canvas._slimer_handle = None
+        self.canvas._slimer_painting = False
+        self.canvas._slimer_last = None
+        self.slimer_drag_toggle.blockSignals(True)
+        try:
+            self.slimer_drag_toggle.setChecked(False)
+        finally:
+            self.slimer_drag_toggle.blockSignals(False)
         if self.slimer_selection is not None:self.slimer_selection=SlimerSelection.empty(self.model.render())
         self.slimer_phase_masks={}
+        self.slimer_phase_transforms={}
+        self.slimer_phase_histories={}
         self._slimer_current_phase=self.slimer_phase_picker.currentText()
         self.slimer_selection_undo.clear();self.slimer_selection_redo.clear()
         for spin,value in ((self.slimer_dx,0),(self.slimer_dy,0),(self.slimer_turn,0),(self.slimer_scale,100)):
@@ -1007,25 +1172,128 @@ class Suite(QMainWindow):
         self._slimer_sync_numeric_values()
         self.refresh()
 
+    def _slimer_transformed_erase_plan(self, mask):
+        """Return a safe single-layer source erase plan, or None.
+
+        Multiple visible layers and pose-specific source buffers remain excluded.
+        The selection must cover every rendered occurrence of each source pixel.
+        """
+        from studio.pixel_source_mapping import (rendered_source_indices,
+            plan_complete_source_erase)
+        states = self.model.resolved_pose()
+        visible = [i for i, state in enumerate(states) if state.get('visible', True)]
+        if len(visible) != 1:
+            return None
+        i = visible[0]
+        state = states[i]
+        part = self.model.parts[i]
+        if i >= len(self.model.originals) or state.get('source_png'):
+            return None
+        source = self.model.originals[i]
+        if source.size != part['image'].size or source.tobytes() != part['image'].tobytes():
+            return None
+        w = max(1, int(state.get('width', source.width)))
+        h = max(1, int(state.get('height', source.height)))
+        mapping = rendered_source_indices(source.size, self.model.size,
+            int(state['x']), int(state['y']), w, h,
+            float(state.get('angle', 0)), self.model.anchors.get(i, [w // 2, h // 2]))
+        alpha = self.model.render_part(i, state).getchannel('A')
+        plan = plan_complete_source_erase(mapping, alpha, mask)
+        if plan is None:
+            return None
+        # Reject any selected visible pixels that have no mapped source.
+        for label, a, selected in zip(mapping.get_flattened_data(),
+                                     alpha.get_flattened_data(),
+                                     mask.get_flattened_data()):
+            if selected and a and label <= 0:
+                return None
+        return i, plan
+
+    def _slimer_original_erase_safe(self, mask=None):
+        """Only erase when canvas pixels map 1:1 to editable source pixels.
+
+        Inspect resolved transforms, not merely local angles: an attached child
+        can inherit rotation or movement from a parent without a local angle.
+        """
+        states = self.model.resolved_pose()
+        if mask is not None and getattr(self, '_slimer_transformed_erase_plan', lambda _mask: None)(mask) is not None:
+            return True
+        for i, state in enumerate(states):
+            if not state.get('visible', True):
+                continue
+            if float(state.get('angle', 0)) % 360:
+                return False
+            # Pure inherited translation is an exact 1:1 pixel mapping.
+            # The erase routine uses resolved canvas coordinates below.
+            part = self.model.parts[i]
+            if i >= len(self.model.originals):
+                return False
+            source = self.model.originals[i]
+            if state.get('source_png'):
+                source = self.model._decode_source(state['source_png'])
+            # Erasing edits part['image'] and originals. If this pose renders a
+            # different saved source, those buffers do not describe its pixels.
+            # Refuse the destructive move until pose-aware source editing exists.
+            # The erase routine mutates both the live part and originals.
+            # Both must match the exact source used by the renderer; otherwise
+            # a pose-local source could conceal edits or erase another pose.
+            if (source.size != part['image'].size
+                    or source.tobytes() != part['image'].tobytes()
+                    or source.size != self.model.originals[i].size
+                    or source.tobytes() != self.model.originals[i].tobytes()):
+                return False
+            if (int(state.get('width', source.width)),
+                    int(state.get('height', source.height))) != source.size:
+                return False
+        return True
+
     def _slimer_erase_original_layers(self, mask):
-        """Erase selected canvas pixels from visible source layers; undo snapshot owns originals."""
+        """Clear selected rendered pixels from their topmost contributing layer.
+
+        Clearing every visible layer would destroy hidden/underlying artwork
+        when multiple source layers overlap at the same canvas coordinate.
+        """
         from PIL import ImageChops
-        for i, part in enumerate(self.model.parts):
-            if not part.get('visible', True):
+        plan = getattr(self, '_slimer_transformed_erase_plan', lambda _mask: None)(mask)
+        if plan is not None:
+            from studio.pixel_source_mapping import erase_planned_source_pixels
+            i, indices = plan
+            image = erase_planned_source_pixels(self.model.originals[i], indices)
+            self.model.parts[i]['image'] = image.copy()
+            self.model.originals[i] = image.copy()
+            return
+        remaining = mask.convert('L').point(lambda a: 255 if a else 0)
+        states = self.model.resolved_pose()
+        for i in range(len(self.model.parts) - 1, -1, -1):
+            part = self.model.parts[i]
+            if not states[i].get('visible', True) or remaining.getbbox() is None:
                 continue
             image = part['image'].convert('RGBA').copy()
-            x, y = int(part['x']), int(part['y'])
-            # Shift the canvas selection into this layer's local coordinates.
-            local_mask = mask.crop((x, y, x + image.width, y + image.height))
-            image.putalpha(ImageChops.subtract(image.getchannel('A'), local_mask))
+            state = states[i]
+            x, y = int(state['x']), int(state['y'])
+            local = remaining.crop((x, y, x + image.width, y + image.height))
+            # Only pixels actually present in this layer can consume the mask.
+            present = image.getchannel('A').point(lambda a: 255 if a else 0)
+            consumed = ImageChops.darker(local, present)
+            if consumed.getbbox() is None:
+                continue
+            image.putalpha(ImageChops.subtract(image.getchannel('A'), consumed))
             part['image'] = image
             if i < len(self.model.originals):
                 self.model.originals[i] = image.copy()
+            canvas_consumed = Image.new('L', self.model.size, 0)
+            canvas_consumed.paste(consumed, (x, y))
+            remaining = ImageChops.subtract(remaining, canvas_consumed)
 
     def _slimer_commit(self,as_frame):
         selection=self.slimer_selection
         if selection is None or selection.mask.getbbox() is None:
             self.status.setText('Highlight some pixels with the Slimer brush first.');return
+        # Validate before touching the timeline. A rejected Move Original must
+        # not save a dirty draft or alter the current frame's recovery state.
+        if self.slimer_move_original.isChecked() and not self._slimer_original_erase_safe(selection.mask):
+            self.status.setText('Move Original is unavailable for this source/selection. Use Copy Pixels instead.')
+            return
         # Commit the current pose BEFORE adding a new part. Otherwise an active
         # draft can accidentally save the new Slimer layer into the previous pose.
         if as_frame:
@@ -1075,7 +1343,12 @@ class Suite(QMainWindow):
                 self.model.angles[overlay_index]=0
             self.assets.setCurrentRow(overlay_index)
         else:
-            self.model.import_part('Slimer layer',result)
+            # Every explicit Place as Layer creates a separate, uniquely named asset.
+            existing={part.get('name', '') for part in self.model.parts}
+            number=1
+            while f'Slimer Layer {number:03d}' in existing:
+                number+=1
+            self.model.import_part(f'Slimer Layer {number:03d}',result)
             self.assets.addItem(self.model.parts[-1]['name'])
             self.assets.setCurrentRow(len(self.model.parts)-1)
         if as_frame:
@@ -1124,20 +1397,70 @@ class Suite(QMainWindow):
         self.refresh_timeline()
         self.refresh()
 
+    def _timeline_history_signature(self):
+        """Identity/order of saved poses, excluding ordinary pixel edits."""
+        return tuple((name, tuple(self.model.pose_id(name, i)
+                                  for i in range(len(poses))))
+                     for name, poses in sorted(self.model.animations.items()))
+
+    def _history_selection(self):
+        """Remember the selected pose by identity, not its shifting row number."""
+        animation = self.anim.currentText()
+        poses = self.model.animations.get(animation, [])
+        pose_id = self.model.pose_id(animation, self.frame) if 0 <= self.frame < len(poses) else None
+        return animation, pose_id, self.frame
+
+    def _after_history_restore(self, previous_timeline, selection):
+        """Restore history, animation selector, pose canvas and Slimer source together."""
+        previous_animation, pose_id, old_index = selection
+        animation = self.model.current
+        if animation not in self.model.animations:
+            animation = (previous_animation if previous_animation in self.model.animations
+                         else next(iter(self.model.animations), ''))
+        if animation != previous_animation:
+            pose_id = None  # IDs from another animation must never select this pose.
+            old_index = 0
+        # History may replace the entire pixel source. A live Slimer selection
+        # refers to pixels from before Undo/Redo and must not survive that swap.
+        self._pose_draft_key = None
+        self._pose_draft_dirty = False
+        self._reset_slimer_for_project_change()
+        if self.anim.currentText() != animation:
+            self.anim.blockSignals(True)
+            try:
+                self.anim.setCurrentText(animation)
+            finally:
+                self.anim.blockSignals(False)
+        self._after_history_change()
+        poses = self.model.animations.get(animation, [])
+        if not poses:
+            self.frame = 0
+            self._pose_draft_key = None
+        else:
+            ids = [self.model.pose_id(animation, i) for i in range(len(poses))]
+            index = ids.index(pose_id) if pose_id in ids else min(max(old_index, 0), len(poses) - 1)
+            self.select_timeline_pose(index)
+        if self._timeline_history_signature() != previous_timeline:
+            self._timeline_structure_changed()
+
     def undo(self):
         if self.slimer_toggle.isChecked() and self.slimer_selection_undo:
             self.slimer_undo_selection();self.status.setText("Undid Slimer selection or transform.");return
+        previous_timeline = self._timeline_history_signature()
+        selection = self._history_selection()
         if self.history.undo(self.model):
             self._pose_draft_dirty=False
-            self._after_history_change()
+            self._after_history_restore(previous_timeline, selection)
             self.status.setText('Undid the last edit. Redo restores it.')
 
     def redo(self):
         if self.slimer_toggle.isChecked() and self.slimer_selection_redo:
             self.slimer_redo_selection();self.status.setText("Restored Slimer selection or transform.");return
+        previous_timeline = self._timeline_history_signature()
+        selection = self._history_selection()
         if self.history.redo(self.model):
             self._pose_draft_dirty=False
-            self._after_history_change()
+            self._after_history_restore(previous_timeline, selection)
             self.status.setText('Restored the edit.')
 
     def move_layer(self,direction):
@@ -1191,8 +1514,11 @@ class Suite(QMainWindow):
     def select_asset(self,i):
         self.selected=i
         self.canvas.selected=i
-        if i<0 or i>=len(self.model.parts):return
+        if i<0 or i>=len(self.model.parts):
+            self.active_asset_label.setText('Editing: No asset selected')
+            return
         p=self.model.parts[i]
+        self.active_asset_label.setText(f"Editing: {self.assets.item(i).text() if self.assets.item(i) else p.get('name', 'Asset')}")
         self.refresh_parent_picker()
         for spin,val in ((self.x,p['x']),(self.y,p['y']),(self.w,p['image'].width),(self.h,p['image'].height)):
             spin.blockSignals(True);spin.setValue(val);spin.blockSignals(False)
@@ -1254,7 +1580,10 @@ class Suite(QMainWindow):
         self._pose_draft_dirty=False
 
     def change_anim(self,name):
-        self.elapsed_ms=0
+        # Switching animations starts the new preview at its first pose.
+        # Rebase the clock so elapsed time from the old animation cannot
+        # advance the new one on the next timer tick.
+        self.restart_playback()
         previous_animation=self.model.current
         self.preserve_pose_draft()
         self._pose_draft_key=None
@@ -1293,6 +1622,7 @@ class Suite(QMainWindow):
         if not poses:
             self.refresh()
         self.refresh_timeline()
+        self.refresh_preview()
     def select_step(self,index):
         if index<0:return
         animation=self.anim.currentText()
@@ -1331,6 +1661,8 @@ class Suite(QMainWindow):
             else:
                 label = canonical
             self.assets.item(index).setText(label)
+        if 0 <= self.selected < self.assets.count():
+            self.active_asset_label.setText(f'Editing: {self.assets.item(self.selected).text()}')
 
     def refresh_timeline(self):
         if not hasattr(self,'timeline'):return
@@ -1429,6 +1761,7 @@ class Suite(QMainWindow):
         source_index = min(max(self.frame, 0), len(frames) - 1)
         index = self.model.copy_frame(name, source_index)
         self._pose_draft_key = None
+        self._timeline_structure_changed()
         self.select_timeline_pose(index)
         self.status.setText(f'Duplicated pose {source_index + 1} as pose {index + 1} in {name}.')
     def select_timeline_pose(self,index):
@@ -1445,14 +1778,49 @@ class Suite(QMainWindow):
         self.timeline.blockSignals(False)
         self.load_frame(index)
 
+    def _timeline_structure_changed(self):
+        """Restart preview timing after frame count/order changes.
+
+        Keep the user's Play/Pause choice; never carry elapsed time from a
+        different timeline layout into the new one.
+        """
+        self.restart_playback()
+
     def insert_pose(self):
         self.preserve_pose_draft()
         if not self.model.parts:
             QMessageBox.warning(self,'Add a creature first','Import your creature parts before adding a pose.');return
         self.remember()
         index=self.model.insert_frame(self.anim.currentText(),self.frame+1)
+        self._timeline_structure_changed()
         self.select_timeline_pose(index)
         self.status.setText(f'Added pose {index+1}. Drag parts to make the next movement!')
+
+    def import_pose_png(self):
+        """Import a full-canvas PNG as a NEW independent timeline pose."""
+        path,_=QFileDialog.getOpenFileName(self,'Import PNG as new pose','','PNG images (*.png)')
+        if not path:return
+        try:
+            with Image.open(path) as opened:
+                image=opened.convert('RGBA')
+            if image.size!=tuple(self.model.size):
+                QMessageBox.warning(self,'Pose size mismatch',
+                    f'The PNG is {image.width} × {image.height} pixels, but this canvas is '
+                    f'{self.model.size[0]} × {self.model.size[1]}. Export a frame PNG '
+                    'to get the correct transparent canvas dimensions.')
+                return
+            self.preserve_pose_draft()
+            self.remember()
+            animation=self.anim.currentText()
+            frames=self.model.animations.get(animation,[])
+            index=self.model.insert_frame(animation,min(self.frame+1,len(frames)))
+            self.model.replace_frame_image(animation,index,image)
+            self.assets.addItem(self.model.parts[-1]['name'])
+            self._timeline_structure_changed()
+            self.select_timeline_pose(index)
+            self.status.setText(f'Imported {Path(path).name} as new independent pose {index+1}.')
+        except (OSError,ValueError) as exc:
+            QMessageBox.warning(self,'Could not import pose',str(exc))
 
     def copy_pose(self):
         self.preserve_pose_draft()
@@ -1461,6 +1829,7 @@ class Suite(QMainWindow):
             self.insert_pose();return
         self.remember()
         index=self.model.copy_frame(self.anim.currentText(),min(self.frame,len(frames)-1))
+        self._timeline_structure_changed()
         self.select_timeline_pose(index)
         self.status.setText('Copied your pose. Make a small change to animate it!')
 
@@ -1471,6 +1840,7 @@ class Suite(QMainWindow):
         if not frames:return
         self.remember()
         self.model.delete_frame(self.anim.currentText(),min(self.frame,len(frames)-1))
+        self._timeline_structure_changed()
         if frames:
             # Load the surviving snapshot; never leave the deleted pose active.
             self.select_timeline_pose(min(self.frame, len(frames)-1))
@@ -1496,39 +1866,70 @@ class Suite(QMainWindow):
         index=min(self.frame,len(frames)-1)
         if not 0 <= index+direction < len(frames):return
         self.remember()
+        self._timeline_structure_changed()
         self.select_timeline_pose(self.model.move_frame(self.anim.currentText(),index,direction))
         self.status.setText('Pose order updated.')
 
     def change_duration(self, value):
         frames=self.model.animations.get(self.anim.currentText(),[])
         if 0 <= self.frame < len(frames):
-            if self.model.frame_duration(self.anim.currentText(),self.frame)!=value:self.remember()
-            self.model.set_frame_duration(self.anim.currentText(),self.frame,value)
+            name = self.anim.currentText()
+            old_durations = [self.model.frame_duration(name, i) for i in range(len(frames))]
+            if old_durations[self.frame] != value:
+                self.remember()
+                # Consume time already spent playing before changing the timeline.
+                if self.play.isChecked():
+                    self.elapsed_ms += self.playback_clock.delta_ms() * float(self.speed.currentData())
+                self.elapsed_ms = retime_elapsed(old_durations, self.frame, self.elapsed_ms, value, self.loop.isChecked())
+            self.model.set_frame_duration(name,self.frame,value)
             self.refresh_timeline()
             summary=timeline_summary([self.model.frame_duration(self.anim.currentText(),i) for i in range(len(frames))])
             self.status.setText(f'Pose timing updated • {summary["seconds"]:.2f}s total for {summary["frames"]} poses. Shorter means faster!')
 
-    def prev_frame(self):self.steps.setCurrentRow(max(0,self.frame-1))
-    def next_frame(self):self.steps.setCurrentRow(min(self.steps.count()-1,self.frame+1))
+    def prev_frame(self):
+        """Navigate saved poses, not the hidden legacy recipe-step list."""
+        poses = self.model.animations.get(self.anim.currentText(), [])
+        if poses:
+            self.select_timeline_pose(max(0, min(self.frame, len(poses)-1)-1))
+
+    def next_frame(self):
+        """Navigate saved poses, respecting the current animation's length."""
+        poses = self.model.animations.get(self.anim.currentText(), [])
+        if poses:
+            self.select_timeline_pose(min(len(poses)-1, max(0, self.frame)+1))
     def play_toggled(self, playing):
-        self.play.setText('⏸ Pause animation' if playing else '▶ Play your animation')
+        name = self.anim.currentText()
+        poses = self.model.animations.get(name, [])
+        if playing and not poses:
+            self.play.blockSignals(True)
+            self.play.setChecked(False)
+            self.play.blockSignals(False)
+            self.playback_clock.pause()
+            self.play.setText('▶ Play your animation')
+            self.status.setText('Add a pose first, then press Play.')
+            self.refresh_preview()
+            return
         if playing:
-            # Resume from the paused clock; restarting is an explicit action.
-            name=self.anim.currentText()
-            if not self.model.animations.get(name,[]):
-                self.play.blockSignals(True);self.play.setChecked(False);self.play.blockSignals(False)
-                self.play.setText('▶ Play your animation')
-                self.status.setText('Add a pose first, then press Play.')
-                return
+            durations = [self.model.frame_duration(name, i) for i in range(len(poses))]
+            self.elapsed_ms = resume_position(self.elapsed_ms, durations, self.loop.isChecked())
+            self.playback_clock.resume()
+        else:
+            self.playback_clock.pause()
+        self.play.setText('⏸ Pause animation' if playing else '▶ Play your animation')
         self.refresh_preview()
     def restart_playback(self,*_):
-        self.elapsed_ms=0;self.playframe=0;self.refresh_preview()
+        self.elapsed_ms=0;self.playframe=0
+        if self.play.isChecked():
+            self.playback_clock.resume()
+        else:
+            self.playback_clock.pause()
+        self.refresh_preview()
     def tick(self):
         if not self.play.isChecked():return
         name=self.anim.currentText();poses=self.model.animations.get(name,[])
         if not poses:return
         durations=[self.model.frame_duration(name,i) for i in range(len(poses))]
-        self.elapsed_ms+=25*float(self.speed.currentData())
+        self.elapsed_ms+=self.playback_clock.delta_ms()*float(self.speed.currentData())
         if not self.loop.isChecked() and self.elapsed_ms>=sum(durations):
             self.elapsed_ms=float(sum(durations))
             self.play.setChecked(False)
@@ -1548,6 +1949,21 @@ class Suite(QMainWindow):
         if filename:
             self.model.render(pose).save(filename,'PNG')
             self.status.setText('Exported transparent frame PNG for editing in Slime House Studios.')
+
+    def export_all_frames(self):
+        """Save every timeline pose as a transparent PNG with timing JSON."""
+        filename,_=QFileDialog.getSaveFileName(
+            self,'Export all animation frames', 'friendly_frames',
+            'Frame set base name (*)')
+        if not filename:
+            return
+        destination=Path(filename)
+        try:
+            images, metadata=self.model.export_individual_frames(destination.parent, destination.stem)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self,'Could not export frames',str(exc))
+            return
+        self.status.setText(f'Exported {len(images)} transparent pose PNGs and {metadata.name}.')
 
     def choose_shs_location(self):
         """Let the user choose the installed or portable SHS .exe once."""
@@ -1709,18 +2125,14 @@ class Suite(QMainWindow):
     def refresh_preview(self):
         name=self.anim.currentText()
         poses=self.model.animations.get(name,[])
-        reference_count=len(TEMPLATES[name])
-        if poses and (self.play.isChecked() or self.elapsed_ms>0):
+        if poses and (self.play.isChecked() or self.elapsed_ms > 0):
             durations=[self.model.frame_duration(name,i) for i in range(len(poses))]
-            creature_index,reference_index=comparison_position(durations,self.elapsed_ms,reference_count,self.loop.isChecked())
+            creature_index,_=comparison_position(durations,self.elapsed_ms,1,self.loop.isChecked())
         else:
             creature_index=self.frame if 0<=self.frame<len(poses) else None
-            reference_index=self.frame%reference_count
         pose=poses[creature_index] if creature_index is not None else None
         self.preview.setPixmap(pixmap(self.model.render(pose),self.preview_zoom))
         self.preview.resize(max(150,self.preview_zoom),max(150,self.preview_zoom))
-        self.desired.setPixmap(pixmap(reference_frame(name,reference_index,body_type=self.reference_body.currentText()),150))
-        self.desired_label.setText(f'Example {reference_index+1}/{reference_count} • {TEMPLATES[name][reference_index]} (optional inspiration)')
     def refresh(self):
         self.canvas._image_size=self.model.size;self.canvas.parts=self.model.parts;self.canvas.selected=self.selected;self.canvas.anchors=self.model.anchors;self.canvas.angles=self.model.angles
         composed=self.model.render()
@@ -1758,14 +2170,22 @@ class Suite(QMainWindow):
         rgba=composed.convert('RGBA');data=rgba.tobytes('raw','RGBA')
         image=QImage(data,rgba.width,rgba.height,rgba.width*4,QImage.Format.Format_RGBA8888).copy()
         self.canvas.slimer_bounds=None
+        confirmed_slimer_preview=None
         if self.slimer_toggle.isChecked() and self.slimer_selection is not None:
             from PIL import ImageDraw
-            preview=self.slimer_preview()
-            self.canvas.slimer_bounds=preview.getchannel('A').getbbox()
-            if self.canvas.slimer_bounds is None and self.slimer_selection.mask.getbbox():
-                x0,y0,x1,y1=self.slimer_selection.mask.getbbox()
-                self.canvas.slimer_bounds=(x0+self.slimer_dx.value(),y0+self.slimer_dy.value(),x1+self.slimer_dx.value(),y1+self.slimer_dy.value())
-            composed.alpha_composite(preview)
+            # Do not even generate a floating preview during highlight painting.
+            # Its source pixels and transformed bounds are needed only after
+            # Finish Selecting; before then the raw mask is the sole selection.
+            if self.canvas.slimer_transform_mode:
+                preview=self.slimer_preview()
+                confirmed_slimer_preview=preview
+                self.canvas.slimer_bounds=preview.getchannel('A').getbbox()
+                if self.canvas.slimer_bounds is None and self.slimer_selection.mask.getbbox():
+                    x0,y0,x1,y1=self.slimer_selection.mask.getbbox()
+                    self.canvas.slimer_bounds=(x0+self.slimer_dx.value(),y0+self.slimer_dy.value(),x1+self.slimer_dx.value(),y1+self.slimer_dy.value())
+                composed.alpha_composite(preview)
+            else:
+                self.canvas.slimer_bounds=self.slimer_selection.mask.getbbox()
             marker=Image.new('RGBA',composed.size)
             # A 10% tint (alpha 26) was nearly invisible on detailed pixel art.
             # Keep the selected color clearly visible without changing source pixels.
@@ -1776,16 +2196,16 @@ class Suite(QMainWindow):
             data=composed.tobytes('raw','RGBA');image=QImage(data,composed.width,composed.height,composed.width*4,QImage.Format.Format_RGBA8888).copy()
         self.canvas.set_art(QPixmap.fromImage(image))
         if hasattr(self, 'slimer_preview_label'):
-            if self.slimer_toggle.isChecked() and self.slimer_selection is not None and self.slimer_selection.mask.getbbox():
-                self.slimer_preview_label.setPixmap(pixmap(self.slimer_preview(), 132))
+            if self.slimer_toggle.isChecked() and self.canvas.slimer_transform_mode and self.slimer_selection is not None and self.slimer_selection.mask.getbbox():
+                self.slimer_preview_label.setPixmap(pixmap(confirmed_slimer_preview, 132))
                 self.slimer_preview_label.setText('')
             else:
                 self.slimer_preview_label.clear()
-                self.slimer_preview_label.setText('Highlight pixels to preview')
+                self.slimer_preview_label.setText('Finish Selecting to show preview' if self.slimer_toggle.isChecked() else 'Activate Slimer to begin')
         self.refresh_preview()
         recipe=TEMPLATES[self.anim.currentText()];step=recipe[self.frame % len(recipe)]
         self.pose_tip.setVisible(self.buddy_toggle.isChecked())
-        self.pose_tip.setText("💡 " + motion_tip(self.anim.currentText(),self.frame,self.reference_body.currentText()) if self.buddy_toggle.isChecked() else '')
+        self.pose_tip.setText("💡 Select a pose in the timeline to edit it. Save Current Pose to keep your changes." if self.buddy_toggle.isChecked() else '')
 
     def _reset_slimer_for_project_change(self):
         """Discard transient selection state, never project artwork or saved poses.
@@ -1796,6 +2216,8 @@ class Suite(QMainWindow):
         self.slimer_selection_undo.clear()
         self.slimer_selection_redo.clear()
         self.slimer_phase_masks={}
+        self.slimer_phase_transforms={}
+        self.slimer_phase_histories={}
         self._slimer_current_phase=self.slimer_phase_picker.currentText()
         self._slimer_mouse_transforming=False
         self.canvas._slimer_painting=False
@@ -1899,10 +2321,15 @@ class Suite(QMainWindow):
 
     def export_animated(self):
         self.preserve_pose_draft()
-        folder=QFileDialog.getExistingDirectory(self,'Export animated GIF and APNG')
-        if not folder:return
+        filename,_=QFileDialog.getSaveFileName(
+            self,'Choose animation export base filename (GIF + APNG)', 'creature.gif', 'GIF animation (*.gif)')
+        if not filename:return
+        target=Path(filename)
+        basename=target.stem if target.suffix.lower()=='.gif' else target.name
+        if not basename.strip():return
+        folder=str(target.parent)
         try:
-            exported=self.model.export_animations(folder)
+            exported=self.model.export_animations(folder,basename=basename)
             self.status.setText(f'Exported {len(exported)} animation files to {folder}')
         except Exception as exc:
             QMessageBox.warning(self,'Animation export failed',str(exc))
@@ -2019,10 +2446,15 @@ class Suite(QMainWindow):
             except Exception as e:QMessageBox.warning(self,'Open failed',str(e))
     def export(self):
         self.preserve_pose_draft()
-        folder=QFileDialog.getExistingDirectory(self,'Export sprite sheet')
-        if folder:
+        filename,_=QFileDialog.getSaveFileName(
+            self,'Choose sprite sheet filename','creature_sheet.png','PNG sprite sheet (*.png)')
+        if filename:
+            target=Path(filename)
+            stem=target.stem if target.suffix.lower()=='.png' else target.name
+            basename=stem[:-6] if stem.endswith('_sheet') else stem
+            if not basename.strip():return
             try:
-                result=self.model.export(folder);self.status.setText(f'Exported {result} and JSON metadata')
+                result=self.model.export(target.parent,basename=basename);self.status.setText(f'Exported {result} and JSON metadata')
             except Exception as e:QMessageBox.warning(self,'Export failed',str(e))
 
 def main():

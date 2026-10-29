@@ -6,6 +6,9 @@ import base64
 import io
 import json
 import math
+import os
+import tempfile
+import shutil
 import hashlib
 import uuid
 from copy import deepcopy
@@ -297,6 +300,76 @@ class PetSuiteModel(CreatureRig):
             frames[index] = updated
         return deepcopy(frames[index])
 
+    def erase_pose_source_pixels(self, animation, frame_index, part_index, indices):
+        """Copy-on-write erase of one saved frame's source pixels.
+
+        Never mutates live part buffers or another frame's source. The caller
+        must separately validate rendered selection provenance before erasing.
+        """
+        from studio.pixel_source_mapping import erase_planned_source_pixels
+        frames = self.animations.get(animation, [])
+        if not 0 <= frame_index < len(frames):
+            raise IndexError('Choose an existing pose to edit.')
+        if not 0 <= part_index < len(frames[frame_index]):
+            raise IndexError('Choose an existing part in that pose.')
+        state = frames[frame_index][part_index]
+        if not state.get('source_png'):
+            raise ValueError('Saved pose has no independent source image.')
+        source = self._decode_source(state['source_png'])
+        updated = erase_planned_source_pixels(source, indices)
+        if updated.tobytes() == source.tobytes():
+            return False
+        replacement = deepcopy(frames[frame_index])
+        replacement[part_index]['source_png'] = self._encode_source(updated)
+        self._store_pose_recovery(animation, frame_index)
+        frames[frame_index] = replacement
+        return True
+
+    def erase_selected_pose_pixels(self, animation, frame_index, part_index, selection_mask):
+        """Safely move a complete rendered selection out of one saved pose.
+
+        This intentionally supports only a single visible, unattached part.
+        Multi-layer compositing and inherited rig transforms require a separate
+        provenance planner; refusing them avoids silently erasing wrong pixels.
+        """
+        from .pixel_source_mapping import rendered_source_indices, plan_complete_source_erase
+        frames = self.animations.get(animation, [])
+        if not 0 <= frame_index < len(frames):
+            raise IndexError('Choose an existing pose to edit.')
+        pose = frames[frame_index]
+        if not 0 <= part_index < len(pose):
+            raise IndexError('Choose an existing part in that pose.')
+        if selection_mask.size != tuple(self.size):
+            raise ValueError('Selection must match the canvas size.')
+        if selection_mask.mode != 'L':
+            raise ValueError('Selection must be a grayscale L mask.')
+        if self.attachments:
+            raise ValueError('Attached parts require resolved rig provenance.')
+        visible = [i for i, state in enumerate(pose) if state.get('visible', True)]
+        if visible != [part_index]:
+            raise ValueError('Saved-pose erase currently requires one visible part.')
+        state = pose[part_index]
+        if not state.get('source_png'):
+            raise ValueError('Saved pose has no independent source image.')
+        source = self._decode_source(state['source_png'])
+        width = int(state.get('width', source.width))
+        height = int(state.get('height', source.height))
+        x, y = int(state['x']), int(state['y'])
+        angle = float(state.get('angle', self.angles.get(part_index, 0)))
+        anchor = self.anchors.get(part_index, [width // 2, height // 2])
+        mapping = rendered_source_indices(source.size, self.size, x, y, width, height,
+                                          angle, anchor)
+        alpha = self.render_part(part_index, state).getchannel('A')
+        plan = plan_complete_source_erase(mapping, alpha, selection_mask)
+        if plan is None:
+            raise ValueError('Selection includes only part of a transformed source pixel.')
+        for label, opacity, selected in zip(mapping.get_flattened_data(),
+                                            alpha.get_flattened_data(),
+                                            selection_mask.get_flattened_data()):
+            if selected and (label <= 0 or opacity == 0):
+                raise ValueError('Selection includes pixels outside the visible source.')
+        return self.erase_pose_source_pixels(animation, frame_index, part_index, plan)
+
     def edit_pose_at(self, animation, index, changes):
         """Apply per-part geometry to one pose without changing any other pose.
 
@@ -443,26 +516,62 @@ class PetSuiteModel(CreatureRig):
 
     def save_project(self, path):
         path = Path(path)
-        folder = path.with_suffix('')
-        folder.mkdir(parents=True, exist_ok=True)
-        for i, image in enumerate(self.originals):
-            image.save(folder / f'original_{i:03d}.png')
-        data = dict(version=2, size=list(self.size), parts=self.snapshot(),
+        # Stage immutable PNG assets in a fresh sibling directory. Never
+        # overwrite the files referenced by the last committed manifest.
+        asset_dir = f'{path.stem}_assets_{uuid.uuid4().hex}'
+        folder = path.parent / asset_dir
+        folder.mkdir(parents=True, exist_ok=False)
+        try:
+            for i, image in enumerate(self.originals):
+                image.save(folder / f'original_{i:03d}.png')
+        except BaseException:
+            shutil.rmtree(folder, ignore_errors=True)
+            raise
+        data = dict(version=3, asset_dir=asset_dir, size=list(self.size), parts=self.snapshot(),
                     animations=self.animations, frame_durations=self.frame_durations,
                     pose_ids={name: self._sync_pose_ids(name)[:] for name in self.animations},
                     pose_recovery={pose_id: deepcopy(history[-self.pose_recovery_limit:])
                                    for pose_id, history in self.pose_recovery.items()
                                    if history and any(pose_id in ids for ids in self.pose_ids.values())},
                     current=self.current, attachments=self.attachments, anchors=self.anchors, angles=self.angles)
-        path.write_text(json.dumps(data, indent=2), encoding='utf-8')
+        # Commit the project manifest last. A failed/interrupted write must not
+        # truncate the previously saved JSON file.
+        temporary = None
+        committed = False
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                                             dir=path.parent, prefix=f'.{path.name}.',
+                                             suffix='.tmp', delete=False) as stream:
+                temporary = Path(stream.name)
+                json.dump(data, stream, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+            committed = True
+        finally:
+            if temporary is not None and temporary.exists():
+                temporary.unlink()
+            if not committed:
+                shutil.rmtree(folder, ignore_errors=True)
+
 
     @classmethod
     def load_project(cls, path):
         path = Path(path)
-        data = json.loads(path.read_text(encoding='utf-8'))
+        from .project_recovery import require_project_assets
+        from .project_validation import validate_project_file
+        data = validate_project_file(path)
+        require_project_assets(path)
+        from .project_png_validation import validate_project_pngs
+        validate_project_pngs(path, data)
         model = cls(data['size'])
+        folder_name = data.get('asset_dir')
+        if folder_name is not None:
+            if (not isinstance(folder_name, str) or Path(folder_name).name != folder_name
+                    or folder_name in ('.', '..')):
+                raise ValueError('Invalid project asset directory')
+        folder = path.parent / folder_name if folder_name else path.with_suffix('')
         for i, state in enumerate(data['parts']):
-            folder = path.with_suffix('')
             original_path = folder / f'original_{i:03d}.png'
             if not original_path.exists():
                 original_path = folder / f'part_{i:03d}.png'  # v0.1 compatibility
@@ -538,6 +647,38 @@ class PetSuiteModel(CreatureRig):
                                         indent=2), encoding='utf-8')
         return png_path
 
+    def export_individual_frames(self, folder, basename='creature'):
+        """Export independent transparent PNGs and their pose timing metadata."""
+        folder = Path(folder)
+        entries = []
+        used = set()
+        for animation, poses in self.animations.items():
+            if not poses:
+                continue
+            safe = ''.join(ch if ch.isalnum() or ch in '-_' else '_' for ch in animation).strip('_') or 'animation'
+            unique = safe
+            suffix = 2
+            while unique.casefold() in used:
+                unique = f'{safe}_{suffix}'
+                suffix += 1
+            used.add(unique.casefold())
+            for index, pose in enumerate(poses):
+                name = f'{basename}_{unique}_{index+1:04d}.png'
+                entries.append((name, self.render(pose).convert('RGBA'), animation, index))
+        if not entries:
+            raise ValueError('Add and save at least one animation pose before exporting.')
+        folder.mkdir(parents=True, exist_ok=True)
+        manifest = []
+        for name, frame, animation, index in entries:
+            frame.save(folder / name, 'PNG')
+            manifest.append({'file': name, 'animation': animation, 'frame': index,
+                             'duration_ms': self.frame_duration(animation, index),
+                             'loop': True})
+        metadata = folder / f'{basename}_frames.json'
+        metadata.write_text(json.dumps({'version': 1, 'frame_size': list(self.size),
+                                        'frames': manifest}, indent=2), encoding='utf-8')
+        return [folder / name for name, _, _, _ in entries], metadata
+
     def export_animations(self, folder, basename='creature', gif=True, apng=True):
         """Export each saved animation as an actual timed, looping GIF and/or APNG."""
         folder = Path(folder)
@@ -567,7 +708,7 @@ class PetSuiteModel(CreatureRig):
                 encode_gif(frames, durations, output)
                 exported.append(output)
             if apng:
-                output = prefix.with_suffix('.png')
+                output = prefix.with_suffix('.apng')
                 from .apng_export import encode_apng
                 encode_apng(frames, durations, output)
                 exported.append(output)

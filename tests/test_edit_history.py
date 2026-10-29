@@ -48,6 +48,31 @@ class EditHistoryTests(unittest.TestCase):
         self.history.redo(self.model)
         self.assertEqual(self.model.frame_duration('Walk',0),260)
 
+    def test_undo_redo_restores_pose_ids_and_recovery(self):
+        self.model.insert_frame('Walk', 0)
+        original_id = self.model.pose_id('Walk', 0)
+        self.model.pose_recovery[original_id] = ['previous snapshot']
+        self.history.record(self.model)
+        self.model.copy_frame('Walk', 0)
+        copied_id = self.model.pose_id('Walk', 1)
+        self.assertNotEqual(original_id, copied_id)
+        self.assertTrue(self.history.undo(self.model))
+        self.assertEqual(self.model.pose_ids['Walk'], [original_id])
+        self.assertEqual(self.model.pose_recovery[original_id], ['previous snapshot'])
+        self.assertTrue(self.history.redo(self.model))
+        self.assertEqual(self.model.pose_ids['Walk'], [original_id, copied_id])
+
+    def test_deleted_pose_undo_restores_recovery_snapshot(self):
+        self.model.insert_frame('Walk', 0)
+        pose_id = self.model.pose_id('Walk', 0)
+        self.model.pose_recovery[pose_id] = ['recovery copy']
+        self.history.record(self.model)
+        self.model.delete_frame('Walk', 0)
+        self.assertNotIn(pose_id, self.model.pose_recovery)
+        self.assertTrue(self.history.undo(self.model))
+        self.assertEqual(self.model.pose_id('Walk', 0), pose_id)
+        self.assertEqual(self.model.pose_recovery[pose_id], ['recovery copy'])
+
     def test_bounded_history(self):
         history=EditHistory(limit=2)
         for n in range(4):

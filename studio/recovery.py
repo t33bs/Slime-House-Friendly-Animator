@@ -15,31 +15,22 @@ def write_recovery(model, path=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     token = uuid.uuid4().hex
     staging = path.with_name(f'_staging_{token}.rig.json')
-    staged_assets = staging.with_suffix('')
-    assets = path.with_suffix('')
-    backup = path.with_name(f'_backup_{token}.rig.json')
-    backup_assets = backup.with_suffix('')
+    staged_asset_dir = None
+    published = False
     try:
         model.save_project(staging)
-        # Ensure that incomplete/corrupt snapshots never replace a valid recovery.
+        import json
+        staged_asset_dir = json.loads(staging.read_text(encoding='utf-8')).get('asset_dir')
         read_recovery(staging)
-        if path.exists(): path.rename(backup)
-        if assets.exists(): assets.rename(backup_assets)
-        try:
-            staged_assets.rename(assets)
-            staging.rename(path)
-        except Exception:
-            if path.exists(): path.unlink()
-            if assets.exists(): shutil.rmtree(assets)
-            if backup.exists(): backup.rename(path)
-            if backup_assets.exists(): backup_assets.rename(assets)
-            raise
-        backup.unlink(missing_ok=True)
-        shutil.rmtree(backup_assets, ignore_errors=True)
+        # The manifest is published last; its referenced asset directory
+        # remains untouched so no path rewrite or partial asset swap occurs.
+        staging.replace(path)
+        published = True
         return path
     finally:
         staging.unlink(missing_ok=True)
-        shutil.rmtree(staged_assets, ignore_errors=True)
+        if not published and staged_asset_dir:
+            shutil.rmtree(path.parent / staged_asset_dir, ignore_errors=True)
 
 
 def read_recovery(path=None):
@@ -51,6 +42,14 @@ def read_recovery(path=None):
 def discard_recovery(path=None):
     import shutil
     path = Path(path) if path is not None else recovery_path()
+    if path.exists():
+        import json
+        try:
+            asset_dir = json.loads(path.read_text(encoding='utf-8')).get('asset_dir')
+            if asset_dir and Path(asset_dir).name == asset_dir:
+                shutil.rmtree(path.parent / asset_dir, ignore_errors=True)
+        except (OSError, ValueError, TypeError):
+            pass
     path.unlink(missing_ok=True)
     shutil.rmtree(path.with_suffix(''), ignore_errors=True)
 
