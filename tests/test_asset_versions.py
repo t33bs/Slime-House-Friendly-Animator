@@ -23,7 +23,10 @@ class AssetVersionsTests(unittest.TestCase):
             self.assertEqual(cleanup_asset_versions(project), [])
             self.assertTrue(old.exists())
             self.assertEqual(cleanup_asset_versions(project, confirmed=True), [])
-            self.assertEqual(cleanup_asset_versions(project, confirmed=True, backup_inventory_complete=True), [old])
+            removed = cleanup_asset_versions(project, confirmed=True, backup_inventory_complete=True)
+            self.assertEqual(len(removed), 1)
+            self.assertEqual(removed[0].name, old.name)
+            self.assertTrue(removed[0].parent.samefile(old.parent))
             self.assertTrue(active.exists())
             self.assertTrue(other.exists())
 
@@ -38,6 +41,7 @@ class AssetVersionsTests(unittest.TestCase):
             active = root / ('cat_assets_' + 'a' * 32)
             old = root / ('cat_assets_' + 'b' * 32)
             active.mkdir(); old.mkdir()
+            (root / 'alias').mkdir()
             project.write_text(json.dumps({'asset_dir': active.name}))
             real_inspect = asset_versions.inspect_asset_versions
             calls = [0]
@@ -54,7 +58,9 @@ class AssetVersionsTests(unittest.TestCase):
             with patch.object(asset_versions, 'inspect_asset_versions', alternate_spelling):
                 removed = asset_versions.cleanup_asset_versions(
                     project, confirmed=True, backup_inventory_complete=True)
-            self.assertEqual(removed, [old])
+            self.assertEqual(len(removed), 1)
+            self.assertEqual(removed[0].name, old.name)
+            self.assertTrue(removed[0].parent.samefile(old.parent))
             self.assertFalse(old.exists())
             self.assertTrue(active.exists())
 
@@ -73,6 +79,7 @@ class AssetVersionsTests(unittest.TestCase):
             active = root / (prefix + 'a' * 32)
             old = root / (prefix + 'b' * 32)
             active.mkdir(); old.mkdir()
+            (root / 'alias').mkdir()
             project.write_text(json.dumps({'asset_dir': active.name}))
             (root / 'backup.json').write_text(json.dumps({'asset_dir': old.name}))
             self.assertEqual(cleanup_asset_versions(project, confirmed=True, backup_inventory_complete=True), [])
@@ -87,6 +94,7 @@ class AssetVersionsTests(unittest.TestCase):
             active = work / ('cat_assets_' + 'a' * 32)
             old = work / ('cat_assets_' + 'b' * 32)
             active.mkdir(); old.mkdir()
+            (root / 'alias').mkdir()
             project.write_text(json.dumps({'asset_dir': active.name}))
             (backup / 'previous.json').write_text(json.dumps({'asset_dir': old.name}))
             self.assertEqual(cleanup_asset_versions(project, confirmed=True,
@@ -100,6 +108,7 @@ class AssetVersionsTests(unittest.TestCase):
             active = root / ('cat_assets_' + 'a' * 32)
             old = root / ('cat_assets_' + 'b' * 32)
             active.mkdir(); old.mkdir()
+            (root / 'alias').mkdir()
             project.write_text(json.dumps({'asset_dir': active.name}))
             self.assertEqual(cleanup_asset_versions(project, confirmed=True), [])
             self.assertEqual(cleanup_asset_versions(project, confirmed=True,
