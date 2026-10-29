@@ -80,7 +80,8 @@ class WindowsBuildTimeoutTests(unittest.TestCase):
 class WindowsPytestGateTests(unittest.TestCase):
     def test_windows_ci_runs_pytest_before_packaging(self):
         workflow = (ROOT / '.github/workflows/build-friendly-animator.yml').read_text()
-        self.assertIn('python -m pytest -q tests', workflow)
+        pytest_command = 'python -u -m pytest -vv -x --tb=short --durations=20 --timeout=120 --timeout-method=thread tests'
+        self.assertIn(pytest_command, workflow)
         self.assertIn('Pytest integration regression suite failed', workflow)
         self.assertIn('FriendlyAnimator-Phase1-Windows-Pytest-Log', workflow)
-        self.assertLess(workflow.index('python -m pytest -q tests'), workflow.index('pyinstaller --noconfirm'))
+        self.assertLess(workflow.index(pytest_command), workflow.index('pyinstaller --noconfirm'))
