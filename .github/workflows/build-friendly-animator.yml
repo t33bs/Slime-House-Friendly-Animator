@@ -20,9 +20,16 @@ jobs:
           python-version: '3.12'
       - run: python -m pip install -r requirements.txt
       - name: Install regression test runner
-        run: python -m pip install "pytest>=8,<10"
+        run: python -m pip install "pytest>=8,<10" "pytest-timeout>=2.3,<3"
       - name: Compile all application and test modules
         run: python -m compileall -q friendly_animator.py studio tests
+      - name: Verify checked-out source and test baseline
+        shell: pwsh
+        run: |
+          Write-Host "Commit: $env:GITHUB_SHA"
+          git rev-parse HEAD
+          python -c "import pathlib; p=pathlib.Path('friendly_animator.py'); s=p.read_text(encoding='utf-8'); required=['_timeline_structure_changed', '_after_history_restore', 'restart_playback']; missing=[name for name in required if name not in s]; print('Source:',p,'bytes:',p.stat().st_size,'missing expected methods:',missing); assert not missing, 'Outdated or incomplete Friendly Animator source checked out'"
+          python -c "import pathlib; p=pathlib.Path('studio/pet_suite_model.py'); print('Model:',p,'bytes:',p.stat().st_size); assert p.exists()"
       - name: Run complete Phase 1 regression suite
         shell: pwsh
         run: |
@@ -30,10 +37,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Phase 1 regression suite failed' }
       - name: Run pytest collection and integration regressions
         shell: pwsh
-        timeout-minutes: 8
+        timeout-minutes: 12
         run: |
-          python -m pytest -q tests 2>&1 | Tee-Object -FilePath phase1-windows-pytest-results.txt
-          if ($LASTEXITCODE -ne 0) { throw 'Pytest integration regression suite failed' }
+          # -vv identifies the last test started if Windows GUI integration hangs.
+          # pytest-timeout emits a stack trace rather than waiting indefinitely.
+          # -x stops at the first failure so the next run has a focused diagnosis.
+          $env:PYTHONUNBUFFERED = '1'
+          python -u -m pytest -vv -x --tb=short --durations=20 --timeout=120 --timeout-method=thread tests 2>&1 | Tee-Object -FilePath phase1-windows-pytest-results.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Pytest integration regression suite failed; inspect pytest log artifact for last test and traceback' }
       - name: Upload Windows pytest regression log
         if: always()
         uses: actions/upload-artifact@v4
